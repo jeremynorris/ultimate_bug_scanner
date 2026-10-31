@@ -367,6 +367,7 @@ class ArchiveEngine(flow.Engine):
                                   for trace in value))
         return state
 
+    # the same control-flow adapter signature as taint_java_traversal.adapter_graph, so one record can serve both; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def adapter_graph(self, statement, following, bindings, reads, node, block, edges,
                       break_to, continue_to, unwind):
         method, name, position = statement.otherwise

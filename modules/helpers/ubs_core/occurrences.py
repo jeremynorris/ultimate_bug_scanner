@@ -114,12 +114,14 @@ class _SourceReader:
     """One bounded-chunk, physical-line reader; no whole-source allocation."""
 
     def __init__(self, path: Path, language: str):
+        # the rule matched this comment's prose; no I/O runs here — ubs:ignore[py.perf.io-in-loop]
         # A replaced source must not block in open() before the work budget
         # can apply. The preliminary check refuses devices; nonblocking open
         # and fstat also cover replacement with a FIFO after that check.
         if not stat.S_ISREG(path.stat().st_mode):
             raise _CodeUnavailable("source_not_regular")
         flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+        # the raw descriptor is fstat-checked before os.fdopen takes it, and the except BaseException below closes it on every failure — ubs:ignore[py.io.open-missing-with]
         descriptor = os.open(path, flags)
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):

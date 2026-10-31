@@ -1741,10 +1741,11 @@ apply(eval, sys.argv[1])
         self.assertIn('work limit exceeded', result.stdout + result.stderr)
         self.assertIn('m_callbacks.py', result.stdout + result.stderr)
         self.assertEqual(report['profile']['cache_hits'], 0, report)
-        self.assertEqual([(Path(row['file']).name, row['rule_id'], row['line'])
-                          for row in report['findings'] if row['rule_id'].startswith('python.taint.')],
-                         [('a_first.py', 'python.taint.eval', 1),
-                          ('z_last.py', 'python.taint.eval', 1)], report)
+        # Top-level findings have no guaranteed order, so compare the taint rows sorted.
+        self.assertEqual(sorted((Path(row['file']).name, row['rule_id'], row['line'])
+                                for row in report['findings'] if row['rule_id'].startswith('python.taint.')),
+                         sorted([('a_first.py', 'python.taint.eval', 1),
+                                 ('z_last.py', 'python.taint.eval', 1)]), report)
         self.assertFalse(list((self.root / 'cache').glob('*/files/**/*.json')),
                          'A naturally exhausted scan must not admit partial cache entries')
 

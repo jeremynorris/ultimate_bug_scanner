@@ -53,6 +53,7 @@ def digest(data: bytes) -> str:
 def read_regular(path: Path, limit: int = MAX_ASSET_BYTES) -> bytes:
     """Hash/read the same opened regular file; never block on a FIFO."""
     # The built-in opener owns the descriptor even if stream initialization
+    # the rule matched this comment's prose; no I/O runs here — ubs:ignore[py.perf.io-in-loop]
     # fails (for example for a directory); fdopen(os.open(...)) can leak it.
     with open(path, "rb", opener=lambda name, flags: os.open(
             name, flags | os.O_NONBLOCK | os.O_NOFOLLOW)) as stream:

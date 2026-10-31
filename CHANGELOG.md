@@ -12,12 +12,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Known issues
 
-All four are in v5.5.3 as well.
+The first five are in v5.5.3 as well.
 
 - **Elixir scans can end partial (exit 2)** (#168). A public function that calls `apply/2,3`, or a file that runs SQL and passes a callback to a function the engine doesn't model, such as `spawn`, stops the SQL analysis. The report says `error: environment`, `reason: module-failed`, but there is nothing to fix in the environment. Findings are still reported, and `UBS_ALLOW_PARTIAL=1` returns the findings exit code.
 - **C# scans can end partial (exit 2) on a `ref`/`out` call the engine can't resolve** (#171), in a file with a SQL sink: `Dictionary.TryGetValue`, the `TryParse` overloads that take number styles or format providers, and cross-file helpers. The report now says `error: analysis`, `reason: analysis-incomplete`, with the file and line. `MailAddress.TryCreate` and the two-argument `TryParse` family no longer end partial.
 - **JavaScript and TypeScript taint analysis can stop at its work limit (exit 2)** (#177). The shape is many helpers called in sequence on one growing array. With no request source in that component, it now finishes, at 160 helpers in our rerun. With a request source in the component, 15 helpers finished and 40 stopped at `js.taint.command`. The report says `error: environment`, `reason: module-failed`, though the cause is the limit. Treat those results as partial, not clean.
+- **A Kotlin `lazy { … }` or `= { … }` property that builds an outbound request from a class field scans as an ordinary initializer.** If a request handler later puts request data in that field, the SSRF is not reported and the scan says ok, as in v5.5.13 and v5.5.3. Java lambdas, anonymous classes and Kotlin `object :` expressions in field initializers report incomplete analysis (exit 2) instead. A narrower check is tracked in bead `ultimate_bug_scanner-tz17`.
 - **`scripts/verify.sh` with no key fails on this release.** It defaults to keyless cosign, and this release has no keyless signatures, SLSA attestation or image signatures, because those need a GitHub Actions run and it was built and signed by hand. `SHA256SUMS` is signed with the project's minisign key, so set `UBS_MINISIGN_PUBKEY` first, as the README's integrity-first install shows.
+- **Python scans can end partial (exit 2) on `dict.fromkeys` over a generator** (#195), in a file the SQL detector reads, when the keys aren't proven to be strings, numbers or `None`. A dict comprehension builds the same dict and scans clean. ubs's own self-scan, which `scripts/cut-release.sh` requires, hit this and a second detector limit in two of its analyzer files, which were rewritten without behaviour change. The self-scan also carries 24 rule-scoped suppressions, with a reason at each site: 15 `py.functions.high-param-count` (bead `ultimate_bug_scanner-8tqg`), 6 `py.perf.io-in-loop`, two of them matches on comment text, and one each of `python.ctcompare.secret_eq`, `py.io.open-missing-with` and `py.parsing.json-loads-no-try`.
 
 ### Added
 
@@ -43,6 +45,8 @@ All four are in v5.5.3 as well.
 - Kotlin category 13 now follows request data into JDBC SQL execution, including Java synthetic properties, source-local helper summaries, SQL captured by prepared statements and statement-owned batch queues. Static SQL with actual value binding stays clean. Named arguments, literal defaults and multiline expression bodies retain helper flow; unsupported receiver and default semantics report incomplete analysis. JSON and SARIF retain source-to-sink evidence, and the SQL work limit participates in cache invalidation.
 
 ### Fixed
+
+- The CLI contract check for `--rules` now takes the modules that honour the flag from the `--rules` entry in `modules/contract.json`. Every other module must refuse the flag as documented (exit 2, `--rules is unsupported for <module>`), so PostgreSQL SQL is checked against its refusal instead of showing as uncovered. The contract's `--rules` list now names Elixir, which already honoured the flag.
 
 - File watching now observes active custom rules from project/environment policy
   and sgconfig rule directories, including internal aliases, so rule-only edits

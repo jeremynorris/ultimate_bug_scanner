@@ -510,6 +510,8 @@ class Engine:
     parser_type = Parser
     source_re = SOURCE_RE
     sink_re = SINK_RE
+    # The parser's guards for class initialization and parameter defaults; None uses sink_re.
+    parser_sink_re = None
     sink_label = 'file sink'
     path_constructors = True
 
@@ -517,7 +519,8 @@ class Engine:
         # FindingSink canonicalizes source locations; evidence and source keys
         # must identify that same file when selection used a symlink alias.
         self.path, self.text = path.resolve(), text
-        self.parser = self.parser_type(text, path.suffix.lower() in {'.kt', '.kts'}, self.source_re, self.sink_re)
+        self.parser = self.parser_type(text, path.suffix.lower() in {'.kt', '.kts'}, self.source_re,
+                                       self.parser_sink_re or self.sink_re)
         self.code = self.parser.code
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget = Budget()
@@ -1004,6 +1007,7 @@ class Engine:
             return None
         return lhs, cursor, cursor + operator.end(), end, operator.group(1)
 
+    # one statement's control-flow edges: statement, successor, bindings, reads, node, block, edges and three jump targets; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def adapter_graph(self, statement, following, bindings, reads, node, block, edges,
                       break_to, continue_to, unwind):
         raise AnalysisLimit('Unsupported Java/Kotlin adapter statement; analysis is incomplete')

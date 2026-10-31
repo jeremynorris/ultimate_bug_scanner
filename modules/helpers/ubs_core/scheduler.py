@@ -57,6 +57,7 @@ def count_file_list(path: Path) -> int:
     """
     with path.open("rb") as source:
         delimiter = b"\n"
+        # bounded 64 KiB reads that stop at the first NUL — ubs:ignore[py.perf.io-in-loop]
         while chunk := source.read(65536):
             if b"\0" in chunk:
                 delimiter = b"\0"
@@ -64,6 +65,7 @@ def count_file_list(path: Path) -> int:
         source.seek(0)
         count = 0
         pending = False
+        # bounded 64 KiB reads that count delimiters without loading the whole list — ubs:ignore[py.perf.io-in-loop]
         while chunk := source.read(65536):
             parts = chunk.split(delimiter)
             for part in parts[:-1]:

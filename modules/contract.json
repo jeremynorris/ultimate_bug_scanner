@@ -159,6 +159,7 @@
         "bash",
         "cpp",
         "csharp",
+        "elixir",
         "golang",
         "java",
         "js",

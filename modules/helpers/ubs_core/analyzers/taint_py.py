@@ -1802,6 +1802,7 @@ class _Flow:
         return join_facts(*(cls.substitute_trace(trace, bound.get(trace.parameter, CLEAN), call_name)
                             for trace in fact))
 
+    # maps one summary binding into the caller: binding, bound arguments, references, node, call name and values; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def substitute_binding(self, binding, bound, references, node, call_name, values, *, substitute=None):
         if binding is None:
             return None

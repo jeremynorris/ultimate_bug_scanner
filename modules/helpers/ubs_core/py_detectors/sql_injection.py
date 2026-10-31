@@ -813,6 +813,7 @@ def build_provenance(tree):
 
 
 class SQLInjectionAnalyzer(ast.NodeVisitor):
+    # its one caller passes the source text and lines, parameter names and risk, sanitizer facts, step limit, budget and bindings; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def __init__(self, text, lines, param_names, name_risk, sanitizers=frozenset(), sanitizer_summaries=None,
                  *, max_steps=100_000, budget=None, bindings=None):
         self.text = text

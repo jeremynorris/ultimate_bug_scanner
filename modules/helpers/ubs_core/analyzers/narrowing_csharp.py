@@ -405,6 +405,7 @@ class GuardFlow:
         return tuple(self.parser.functions[function] for item in kinds
                      for function in self.property_accessors.get(key, {}).get(item, ()))
 
+    # the walker's state and bindings plus four per-access flags its 10 callers set independently; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def property_access(self, name, state, bindings, kind="get", position=0, fresh=False, guard=False):
         key = self.property_key(name, bindings, position)
         if key not in self.properties:
@@ -449,6 +450,7 @@ class GuardFlow:
         entries.append((beginning, end))
         return entries
 
+    # a token span with the walker's state, bindings and depth, plus the owner being initialised; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def object_initializer(self, start, end, state, bindings, depth, owner="", anonymous=False):
         """Visit fresh receiver member initializers without rebinding caller names."""
         if depth > 96:
@@ -556,6 +558,7 @@ class GuardFlow:
         return bool(receiver and receiver not in {"this", "base"}
                     and (receiver in bindings or receiver.split(".", 1)[0] in bindings))
 
+    # overload lookup by name, argument count, bindings, position and enclosing function, with two optional refinements; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def call_candidates(self, name, count, bindings, position, function, state=None, constructor=False):
         name = re.sub(r"\s|@", "", name)
         qualifier, _, short = name.rpartition(".")
@@ -627,6 +630,7 @@ class GuardFlow:
         return [function for function in contained if not any(
             other.start <= function.key < other.end for other in contained if other.key != function.key)]
 
+    # the summary pass over a token span: bindings, function, its three accumulators (writes, calls, values), depth and owner; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def summary_initializer(self, start, end, bindings, function, writes, calls, values, depth, owner="", anonymous=False):
         if depth > 96:
             raise AnalysisLimit("C# call-write initializer limit exceeded; null analysis is incomplete")
@@ -661,6 +665,7 @@ class GuardFlow:
             else:
                 self.summary_expression(first, last, bindings, function, writes, calls, values, depth + 1)
 
+    # the same summary pass for one expression span, with its three accumulators and depth; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def summary_expression(self, start, end, bindings, function, writes, calls, values, depth=0):
         self.budget.spend()
         if depth > 96:
@@ -859,6 +864,7 @@ class GuardFlow:
                 state.values[binding] = replace(value, nulls=value.nulls | nulls,
                                                 opaque_callable=value.opaque_callable or bool(value.callables))
 
+    # a call's name and bracket span with the walker's state, bindings and position, plus two call options; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def apply_call(self, name, opening, closing, state, bindings, position, constructor=False, call_state=None):
         if state.exit:
             return
@@ -940,6 +946,7 @@ class GuardFlow:
         pending = self.exceptions[-1]
         signature = state.signature()
         self.budget.spend(len(pending) + 1)
+        # signature() is this flow state's (exit, sorted values) fingerprint, compared to drop duplicate states; no secret is involved — ubs:ignore[python.ctcompare.secret_eq]
         if all(previous.signature() != signature for previous in pending):
             pending.append(state.copy())
             if len(pending) > 128:

@@ -52,6 +52,16 @@ SINK_RE = re.compile(
     r'|\b(?:Jsoup\.connect|Unirest\.(?:get|post|put|delete|patch|head)|Request\.(?:Get|Post|Put|Delete))\s*\('
     r'|\.\s*(?:openConnection|openStream|uri|url|build)\s*\(',
 )
+# Class initialization the parser refuses: SINK_RE without its bare `.build(`, which any builder chain in a field
+# initializer matches. A request builder there still shows HttpRequest.newBuilder(, .uri(, .url( or a client call.
+INIT_SINK_RE = re.compile(SINK_RE.pattern.replace('|uri|url|build)', '|uri|url)'))
+# A lambda or an anonymous class body there can run later with request data, so that region keeps the bare `.build(`.
+DEFERRED_INIT_RE = re.compile(r'->|\bnew\s+[\w.<>?, ]+\([^;{}]*\)\s*\{|\bobject\s*:')
+
+
+class InitSinkGuard:
+    def search(self, text):
+        return (SINK_RE if DEFERRED_INIT_RE.search(text) else INIT_SINK_RE).search(text)
 
 KINDS = frozenset({'ssrf-uri', 'ssrf-url', 'ssrf-builder', 'ssrf-request', 'ssrf-text'})
 PROOFS = frozenset({'ssrf-scheme', 'ssrf-host'})
@@ -63,6 +73,7 @@ class SSRFEngine(RedirectEngine):
     """URI identities and a finite, intraprocedural JDK builder store."""
 
     source_re, sink_re = SOURCE_RE, SINK_RE
+    parser_sink_re = InitSinkGuard()
     sink_label = 'outbound HTTP destination'
 
     def __init__(self, path, text):

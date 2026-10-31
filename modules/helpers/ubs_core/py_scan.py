@@ -599,6 +599,7 @@ def _source_versions(files: Sequence[Path], problems: list[str]) -> dict[Path, t
             identity = str(path.resolve(strict=True))
             digest = hashlib.blake2b(digest_size=16)
             with path.open("rb") as source:
+                # bounded 128 KiB reads feeding the digest; reading in chunks is the point of this loop — ubs:ignore[py.perf.io-in-loop]
                 while chunk := source.read(128 * 1024):
                     digest.update(chunk)
             versions[path] = (identity, digest.hexdigest())
