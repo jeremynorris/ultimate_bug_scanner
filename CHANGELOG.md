@@ -28,6 +28,9 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   analyzer no longer needs a secret-comparison suppression for its state
   signature. Unknown signatures, secret-bearing records, mutable aliases
   and escaped receivers remain security findings.
+  Secret evidence also survives branch joins, loop backedges and caught
+  exceptions. Secret containers and chained comparisons retain findings;
+  stable local unkeyed digest wrappers keep public checksums quiet.
 - Python SQL analysis separates independent deferred helpers from reachable
   SQL effects, resolves bounded ordinary attribute-name tables, and checks
   local `execute` wrappers before treating their names as database APIs.

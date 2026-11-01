@@ -601,5 +601,269 @@ class StructuralFingerprintTests(unittest.TestCase):
         self.assertEqual(ctcompare_py._scan_code(source), [])
 
 
+class PythonSecretComparisonFlowTests(unittest.TestCase):
+    """Public fingerprint evidence must not erase a possible credential."""
+
+    def assert_sites(self, source):
+        code = StructuralFingerprintTests.RECORDS + textwrap.dedent(source)
+        expected = [number for number, line in enumerate(code.splitlines(), 1)
+                    if '# expect-secret' in line]
+        actual = [line for _path, line, _code in ctcompare_py._scan_code(code)]
+        self.assertEqual(actual, expected, code)
+
+    def test_conditional_public_overwrite_preserves_secret_on_other_path(self):
+        self.assert_sites('''
+            def verify(state: State, password, supplied, flag):
+                value = password
+                if flag:
+                    value = state.signature()
+                return value == supplied  # expect-secret
+        ''')
+        for first, second in (('password', 'state.signature()'), ('state.signature()', 'password')):
+            with self.subTest(first=first):
+                self.assert_sites(
+                    'def verify(state: State, password, supplied, flag):\n'
+                    '    if flag:\n'
+                    f'        value = {first}\n'
+                    '    else:\n'
+                    f'        value = {second}\n'
+                    '    return value == supplied  # expect-secret\n'
+                )
+
+    def test_public_overwrite_on_every_normal_branch_is_clean(self):
+        source = '''
+            def verify(state: State, password, supplied, flag):
+                value = password
+                if flag:
+                    value = state.signature()
+                else:
+                    value = State().signature()
+                return value == supplied
+        '''
+        self.assert_sites(source)
+        self.assert_sites(source.replace('password', 'public_label'))
+
+    def test_zero_iteration_loops_and_exception_paths_preserve_secret_aliases(self):
+        bodies = (
+            'for item in items:\n        value = state.signature()',
+            'while items:\n        value = state.signature()\n        break',
+            'try:\n        value = state.signature()\n    except Exception:\n        pass',
+        )
+        if sys.version_info >= (3, 10):
+            bodies += ('match items:\n        case []:\n            value = state.signature()',)
+        for body in bodies:
+            with self.subTest(body=body):
+                source = (
+                    'def verify(state: State, password, supplied, items):\n'
+                    '    value = password\n'
+                    '    ' + body + '\n'
+                    '    return value == supplied  # expect-secret\n'
+                )
+                self.assert_sites(source)
+                self.assert_sites(source.replace('password', 'public_label').replace('  # expect-secret', ''))
+
+    def test_secret_container_literal_and_alias_comparisons_remain_findings(self):
+        self.assert_sites('''
+            def verify(password, supplied):
+                direct = (password,) == ("guess",)  # expect-secret
+                value = [password]
+                alias = value
+                copied = alias != ["guess"]  # expect-secret
+                mapping = {"value": password}
+                mapped = mapping != {"value": supplied}  # expect-secret
+                keyed = {password: 1} == {supplied: 1}  # expect-secret
+                return direct, copied, mapped, keyed
+        ''')
+
+    def test_loop_targets_and_backedges_preserve_comparison_evaluation(self):
+        self.assert_sites('''
+            def target(slots, password, supplied, items):
+                for slots[password == supplied] in items:  # expect-secret
+                    pass
+            def backedge(state: State, password, supplied, items):
+                value = state.signature()
+                for item in items:
+                    accepted = value == supplied  # expect-secret
+                    value = password
+                return accepted
+            def while_backedge(state: State, password, supplied, ready):
+                value = state.signature()
+                while ready and value != supplied:  # expect-secret
+                    value = password
+        ''')
+
+    def test_exception_handler_joins_intermediate_and_nested_statement_states(self):
+        self.assert_sites('''
+            def verify(state: State, password, supplied, flag):
+                value = state.signature()
+                try:
+                    if flag:
+                        value = password
+                        work()
+                        value = state.signature()
+                    work()
+                    value = state.signature()
+                except Exception:
+                    return value == supplied  # expect-secret
+            def separate_function(state: State, password, supplied):
+                value = state.signature()
+                try:
+                    def unrelated():
+                        value = password
+                        work()
+                    work()
+                except Exception:
+                    return value == supplied
+        ''')
+
+    def test_conditional_container_and_branch_alias_keep_material_provenance(self):
+        self.assert_sites('''
+            def conditional(state: State, password, flag):
+                value = (password,) if flag else state.signature()
+                return value == ("guess",)  # expect-secret
+            def branch(state: State, password, flag):
+                value = (password,)
+                if flag:
+                    value = state.signature()
+                return value == ("guess",)  # expect-secret
+        ''')
+
+    def test_container_evidence_does_not_cross_function_boundaries(self):
+        self.assert_sites('''
+            def secret(password):
+                value = (password,)
+                return value == ("guess",)  # expect-secret
+            def public():
+                value = ("mode", "read")
+                return value == ("mode", "read")
+        ''')
+
+    def test_adjacent_comparison_pairs_own_numeric_and_shape_exemptions(self):
+        self.assert_sites('''
+            def verify(count, password, supplied, expected_signature):
+                first = 0 == count == password == supplied  # expect-secret
+                second = password == supplied != 0  # expect-secret
+                third = ("a", "b") == count == expected_signature  # expect-secret
+                clean = count == 0 == count
+                return first, second, third, clean
+        ''')
+
+    def test_literal_dispatch_and_timing_safe_calls_stay_clean(self):
+        self.assert_sites('''
+            def dispatch(self, node, completion):
+                sig = self._call_signature(node)
+                if sig == ("socket", "socketpair"):
+                    return 1
+                return self._reference_signature(completion) == ("asyncio", "ALL_COMPLETED")
+            def verify(password, supplied):
+                return hmac.compare_digest(password, supplied)
+        ''')
+
+    def test_real_python_module_preserves_public_and_secret_pair(self):
+        import json
+        import os
+        import shutil
+        import subprocess
+
+        if shutil.which('rg') is None or shutil.which('jq') is None:
+            self.skipTest('Python module requires rg and jq')
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='ctcompare-flow-', dir=artifacts))
+        source = StructuralFingerprintTests.RECORDS + textwrap.dedent('''
+            def ordinary(state: State):
+                signature = state.signature()
+                return signature == State().signature()
+            def verify(state: State, password, supplied, flag):
+                value = password
+                if flag:
+                    value = state.signature()
+                return value == supplied
+        ''')
+        path = root / 'comparisons.py'
+        path.write_text(source, encoding='utf-8')
+        for output_format in ('json', 'sarif'):
+            command = [str(REPO_ROOT / 'modules/ubs-python.sh'), str(path),
+                       '--ci', '--format=' + output_format]
+            completed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False,
+                                       timeout=60, env={**os.environ, 'UBS_NO_AUTO_UPDATE': '1',
+                                                        'UBS_CATEGORY_FILTER': '7'})
+            (root / (output_format + '.stdout')).write_text(completed.stdout, encoding='utf-8')
+            (root / (output_format + '.stderr')).write_text(completed.stderr, encoding='utf-8')
+            print('[ctcompare-flow-%s] exit=%s command=%r' % (output_format, completed.returncode, command))
+            self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+            document = json.loads(completed.stdout)
+            if output_format == 'json':
+                self.assertEqual(document['status'], 'ok')
+                findings = [row for row in document['findings'] if row['rule'] == ctcompare_py.RULE_ID]
+                self.assertEqual([(sample['line'], row['severity']) for row in findings
+                                  for sample in row['samples']],
+                                 [(len(source.splitlines()), 'critical')])
+            else:
+                findings = [row for row in document['runs'][0]['results'] if row['ruleId'] == ctcompare_py.RULE_ID]
+                self.assertEqual([row['locations'][0]['physicalLocation']['region']['startLine']
+                                  for row in findings], [len(source.splitlines())])
+
+    def test_local_unkeyed_digest_wrapper_is_public_only_for_public_inputs(self):
+        self.assert_sites('''
+            import hashlib
+            def digest(data):
+                return hashlib.sha256(data).hexdigest()
+            def checksum(payload, expected, password):
+                try:
+                    public = digest(payload)
+                except OSError:
+                    public = ""
+                accepted = public == expected
+                secret_value = digest(password)
+                first = secret_value == expected  # expect-secret
+                second = digest(data=password) == expected  # expect-secret
+                return accepted, first, second
+        ''')
+
+    def test_digest_helper_binding_and_implementation_must_be_resolved(self):
+        variants = (
+            ('import hashlib', 'hashlib.sha256(data).hexdigest()', 'def other(digest):\n    return digest\n'),
+            ('import hashlib', 'hashlib.sha256(data).hexdigest()', 'hashlib.sha256 = replacement\n'),
+            ('import hashlib', 'hashlib.sha256(data).hexdigest()', 'hashlib.__setattr__("sha256", replacement)\n'),
+            ('import hashlib', 'hashlib.sha256(data).hexdigest()', 'from unknown import *\n'),
+            ('import sys\nsys.modules["hashlib"] = forged\nimport hashlib',
+             'hashlib.sha256(data).hexdigest()', ''),
+            ('from .hashlib import sha256', 'sha256(data).hexdigest()', ''),
+            ('import hashlib', 'hashlib.sha256(data).hexdigest()', 'mutate(hashlib)\n'),
+            ('import hashlib', 'hashlib.sha256(data).hexdigest()', 'mutate(digest)\n'),
+            ('import hashlib', 'hashlib.blake2b(data, key=key).hexdigest()', ''),
+            ('import hashlib', 'opaque(data)', ''),
+            ('from somewhere import sha256', 'sha256(data).hexdigest()', ''),
+        )
+        for imports, expression, suffix in variants:
+            with self.subTest(expression=expression, suffix=suffix):
+                self.assert_sites(
+                    imports + '\ndef digest(data):\n    return ' + expression + '\n' + suffix
+                    + 'def verify(payload, supplied):\n    return digest(payload) == supplied  # expect-secret\n'
+                )
+        self.assert_sites('''
+            def verify(payload, supplied):
+                return digest(payload) == supplied  # expect-secret
+        ''')
+
+    def test_hashlib_import_aliases_keep_the_wrapper_input_role(self):
+        self.assert_sites('''
+            import hashlib as hashes
+            from hashlib import sha512 as checksum_ctor
+            def digest(data):
+                return hashes.sha256(data).hexdigest()
+            def hexdigest(data):
+                return checksum_ctor(data).hexdigest()
+            def verify(payload, supplied, password):
+                accepted = digest(payload) == supplied
+                return accepted, hexdigest(password) == supplied  # expect-secret
+        ''')
+
+    def test_actual_release_contract_digest_is_public(self):
+        source = (REPO_ROOT / 'scripts/release_generation.py').read_text(encoding='utf-8')
+        self.assertEqual(ctcompare_py._scan_code(source), [])
+
+
 if __name__ == "__main__":
     unittest.main()
