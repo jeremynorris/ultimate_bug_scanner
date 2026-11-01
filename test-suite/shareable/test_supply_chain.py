@@ -135,7 +135,6 @@ class Sandbox:
             "UBS_NO_AUTO_UPDATE": "1",
             "UBS_SKIP_SIZE_CHECK": "1",
             "UBS_REPO_RAW_BASE": f"file://{self.raw_base}",
-            "PATH": "/usr/local/bin:/usr/bin:/bin" + (":" + os.environ.get("PATH", "") if os.environ.get("PATH") else ""),
         })
         env.update(dict(extra_env))
         cmd = [str(self.bin_dir / "ubs"), f"--module-dir={self.module_dir}", "--only=python", "--ci", "--format=json", str(PY_FIXTURE)]
@@ -493,7 +492,7 @@ exec "$UBS_TEST_REAL_SHA256SUM" "$@"
 
 
 def killer_stub_env(tmp: Path, target: str, mode: str) -> list[tuple[str, str]]:
-    real = shutil.which("sha256sum", path="/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin")
+    real = shutil.which("sha256sum")
     if real is None:
         raise RuntimeError("no real sha256sum found to wrap")
     stub_dir = tmp / "stub-bin"
@@ -504,7 +503,7 @@ def killer_stub_env(tmp: Path, target: str, mode: str) -> list[tuple[str, str]]:
     log = tmp / "stub.log"
     log.write_text("", encoding="utf-8")
     return [
-        ("PATH", f"{stub_dir}:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin:{os.environ.get('PATH', '')}"),
+        ("PATH", str(stub_dir) + os.pathsep + os.environ.get("PATH", os.defpath)),
         ("UBS_TEST_REAL_SHA256SUM", real),
         ("UBS_TEST_STUB_TARGET", target),
         ("UBS_TEST_STUB_MODE", mode),
@@ -619,7 +618,6 @@ def test_tampered_helper_refused() -> None:
         env.update({
             "NO_COLOR": "1",
             "UBS_ALLOW_UNVERIFIED_HELPERS": "0",
-            "PATH": "/usr/local/bin:/usr/bin:/bin" + (":" + os.environ.get("PATH", "") if os.environ.get("PATH") else ""),
         })
         env.pop("UBS_VERIFIED_ASSET_DIR", None)
 
@@ -676,7 +674,6 @@ def test_standalone_module_verifies() -> None:
         env.update({
             "NO_COLOR": "1",
             "UBS_ALLOW_UNVERIFIED_HELPERS": "0",
-            "PATH": "/usr/local/bin:/usr/bin:/bin" + (":" + os.environ.get("PATH", "") if os.environ.get("PATH") else ""),
         })
         env.pop("UBS_VERIFIED_ASSET_DIR", None)
 
