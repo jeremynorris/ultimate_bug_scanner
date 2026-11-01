@@ -24,6 +24,7 @@ from typing import Iterable, Iterator
 
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import SourceSuppressions
+from ubs_core.lexer import javascript_lexical_views
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 
@@ -258,6 +259,93 @@ def only_safe_tagged_templates(statement: str) -> bool:
     )
 
 
+def permits_drizzle_bindings(text: str) -> bool:
+    """Conservative file-level prerequisite for the Drizzle execution shape.
+
+    Raw fragments, aliases and local rebinding make lexical proof insufficient.
+    Keep those files on the existing detection path rather than treating every
+    function named ``sql`` as a parameterizing provider.
+    """
+    source, code = javascript_lexical_views(text)
+    imports = re.finditer(
+        r'\bimport\s*\{([^}]+)\}\s*from\s*([\'"])drizzle-orm\2', source
+    )
+    imported = any(
+        code[match.start():match.start() + 6] == 'import'
+        and 'sql' in (name.strip() for name in match.group(1).split(','))
+        for match in imports
+    )
+    if not imported:
+        return False
+    # SQL/SQLChunk constructors can insert raw fragments, including through an
+    # aliased import. Their presence requires richer value provenance.
+    if any(re.search(r'\b(?:SQL|StringChunk)\b', match.group(1))
+           for match in re.finditer(r'\bimport\s*\{([^}]+)\}\s*from\s*([\'"])drizzle-orm\2', source)):
+        return False
+    uncertain = re.compile(
+        r'\.\s*raw\b|\b(?:sql|Prisma)\s*\['
+        r'|\b(?:queryRawUnsafe|executeRawUnsafe)\b'
+        r'|\b(?:const|let|var|function|class)\s+sql\b'
+        r'|\bsql\s*=(?!=)|=\s*sql\s*(?:[;,)]|$)'
+        r'|\b(?:const|let|var)\s*\{[^}]*\bsql\b'
+        r'|\bfunction\b[^()]*\([^)]*\bsql\b'
+        r'|\([^()]*\bsql\b[^()]*\)\s*(?::[^=]*)?=>'
+        r'|(?:\(|,)\s*sql\s*(?=[:,)=])|\bcatch\s*\([^)]*\bsql\b'
+        r'|\bnew\s+(?:SQL|StringChunk)\b'
+    )
+    return not uncertain.search(code)
+
+
+def only_bound_drizzle_execution(statement: str) -> bool:
+    """Every execution sink must receive one complete ``sql`...` `` value.
+
+    The shared lexical view retains interpolation expressions and substitutes
+    balanced parentheses for template boundaries. It prevents SQL-looking text
+    in strings/comments from establishing a safe tag and keeps nested execution
+    sinks visible. An incomplete bounded statement never establishes safety.
+    """
+    source, code = javascript_lexical_views(statement)
+    templates: dict[int, int] = {}
+    for match in re.finditer(r'(?<![\w$.])sql\s*`', source):
+        opening = match.end() - 1
+        if code[match.start():opening].strip() != 'sql' or code[opening] != '(':
+            continue
+        depth = 0
+        for offset in range(opening, len(code)):
+            if code[offset] == '(':
+                depth += 1
+            elif code[offset] == ')':
+                depth -= 1
+                if depth == 0:
+                    # A call may return an unsafe SQL wrapper rather than a
+                    # bound scalar. Do not claim safety for opaque builders.
+                    if (source[offset] == '`'
+                            and not re.search(r'(?:[\w$]|\])\s*\(', code[opening + 1:offset])):
+                        templates[match.start()] = offset + 1
+                    break
+    if not templates:
+        return False
+    found = False
+    for sink in sql_sink_re.finditer(source):
+        # Ignore sink-shaped literal text, while keeping real nested calls.
+        if code[sink.start():sink.end() - 1] != source[sink.start():sink.end() - 1]:
+            continue
+        found = True
+        if not re.fullmatch(r'\.\s*(?:query|execute)\s*\(', sink.group(), re.I):
+            return False
+        argument = sink.end()
+        while argument < len(code) and code[argument].isspace():
+            argument += 1
+        end = templates.get(argument)
+        if end is None:
+            return False
+        while end < len(code) and code[end].isspace():
+            end += 1
+        if end == len(code) or code[end] != ')':
+            return False
+    return found
+
+
 def source_line(lines: list[str], index: int) -> str:
     if 0 <= index < len(lines):
         return lines[index].strip().replace('\t', ' ')
@@ -275,6 +363,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str, str]]:
     text = '\n'.join(lines)
     if not (sql_sink_re.search(text) or sql_keyword_re.search(text)):
         return
+    drizzle_bindings = permits_drizzle_bindings(text)
     tainted: set[str] = set()
     tainted_sql: set[str] = set()
     seen: set[tuple[str, int, str]] = set()
@@ -313,6 +402,8 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str, str]]:
         if not sql_sink_re.search(statement):
             continue
         if only_safe_tagged_templates(statement):
+            continue
+        if drizzle_bindings and only_bound_drizzle_execution(statement):
             continue
 
         sql_var_refs = refs(statement, tainted_sql)

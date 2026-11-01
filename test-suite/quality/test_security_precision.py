@@ -4255,5 +4255,348 @@ class EvalRuleIdentifierBoundaryTests(unittest.TestCase):
         ]), ["eval(code)", "obj.instance_eval(code)"])
 
 
+@unittest.skipUnless(os.environ.get("UBS_DRIZZLE_BASELINE"),
+                     "set UBS_DRIZZLE_BASELINE to the incumbent runner for paired public CLI scans")
+class DrizzleBoundSqlPublicTests(unittest.TestCase):
+    """Bound Drizzle calls lose SQL-rule false positives; raw SQL stays critical.
+
+    Both real scanners run in this invocation on identical retained TS files.
+    No fixture runs as application code, and no scanner result is substituted.
+    Three clean fixtures retain a companion taint-rule false positive and exit
+    nonzero on both scanners. Preserve those findings too: this is a SQL-rule
+    improvement, not whole-scanner cleanliness, a live database/security test
+    or complete JavaScript binding proof.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "drizzle-bound-sql"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="run-", dir=artifacts))
+
+    @staticmethod
+    def programs(clean):
+        prefix = ('import { sql } from "drizzle-orm";\n'
+                  'export async function run(req: RequestContext) {\n'
+                  '  const value = req.body.value;\n')
+        if clean:
+            bodies = {
+                "simple": '  return db.execute(sql`SELECT * FROM records WHERE id = ${value}`);\n',
+                "lock": ('  await tx.execute(sql`SELECT pg_advisory_xact_lock(\n'
+                         "    hashtextextended('bot:' || lower(${value}), 0)\n"
+                         '  )`);\n'),
+                "key-date": ('  const result = (await db.execute(sql`\n'
+                             '    SELECT COUNT(*) FROM moderation_decisions\n'
+                             '    WHERE model_versions->>${req.query.key} = ${value}\n'
+                             '      AND created_at >= ${req.body.since}\n'
+                             '  `)) as unknown as CountRow[];\n'),
+                "decoys": ('  const example = "sql`example`"; // sql.raw(req.body.query)\n'
+                           '  return db.query(sql`SELECT id FROM records WHERE id = ${value}`);\n'),
+            }
+        else:
+            bodies = {
+                "plain-template": "  return db.execute(`SELECT * FROM records WHERE id = '${value}'`);\n",
+                "concat": '  return db.execute("SELECT * FROM records WHERE id = " + value);\n',
+                "raw": '  return db.execute(sql.raw("SELECT * FROM records WHERE id = " + value));\n',
+                "nested-raw": '  return db.execute(sql`SELECT * FROM records WHERE ${sql.raw(value)}`);\n',
+                "raw-alias": ('  const unsafe = sql.raw;\n'
+                              '  return db.execute(unsafe("SELECT * FROM records WHERE id = " + value));\n'),
+                "prisma-unsafe": "  return prisma.$queryRawUnsafe(`SELECT * FROM records WHERE id = '${value}'`);\n",
+                "mixed": ('  await db.execute(sql`SELECT * FROM records WHERE id = ${value}`); '
+                          "return db.execute(`SELECT * FROM records WHERE id = '${value}'`);\n"),
+                "string-decoy": ('  const example = "sql`example`";\n'
+                                 "  return db.execute(`SELECT * FROM records WHERE id = '${value}'`);\n"),
+                "incomplete": '  return db.execute(sql`SELECT * FROM records WHERE id = ${value}\n',
+                "shadowed": '  return db.execute(sql`SELECT * FROM records WHERE id = ${value}`);\n',
+            }
+        result = []
+        for name, body in bodies.items():
+            source = prefix + body + ('' if name == "incomplete" else '}\n')
+            if name == "shadowed":
+                source = source.replace('run(req: RequestContext)', 'run(req: RequestContext, sql: Function)')
+            sink = next(line for line, text in enumerate(source.splitlines(), 1)
+                        if 'db.execute(' in text or 'tx.execute(' in text or
+                        'db.query(' in text or '$queryRawUnsafe(' in text)
+            result.append((name + '.ts', source, sink))
+        return result
+
+    def test_incumbent_and_candidate_json_sarif_exact_sql_sites(self):
+        baseline = Path(os.environ["UBS_DRIZZLE_BASELINE"]).resolve()
+        self.assertTrue(baseline.is_file(), "the real incumbent runner is required")
+        for clean in (True, False):
+            directory = self.root / ("bound" if clean else "unsafe")
+            directory.mkdir()
+            programs = self.programs(clean)
+            for name, source, _line in programs:
+                (directory / name).write_text(source, encoding="utf-8")
+            for label, runner in (("incumbent", baseline), ("candidate", REPO_ROOT / "ubs")):
+                expected = [] if clean and label == "candidate" else sorted(
+                    (name, line, "critical") for name, _source, line in programs)
+                companion = sorted(
+                    (name, line, "critical") for name, _source, line in programs
+                    for _ in range(2 if name == "mixed.ts" else 1)
+                    if name not in ({"lock.ts"} if clean else {"incomplete.ts", "prisma-unsafe.ts"})
+                )
+                for format_ in ("json", "sarif"):
+                    case = f"{directory.name}-{label}-{format_}"
+                    with self.subTest(case=case):
+                        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_KEEP_TEMP="1",
+                                   UBS_NO_AUTO_UPDATE="1", UBS_ENABLE_AUTO_UPDATE="0", UBS_NO_CACHE="1",
+                                   CI="1", NO_COLOR="1", UBS_CACHE_DIR=str(directory / (case + "-cache")),
+                                   XDG_CONFIG_HOME=str(directory / (case + "-config")),
+                                   XDG_DATA_HOME=str(directory / (case + "-data")))
+                        command = ["bash", str(runner), "--no-auto-update", "--only=js",
+                                   "--format=" + format_, "--ci", str(directory)]
+                        print(f"[drizzle-{case}] RUN {command!r}", flush=True)
+                        started = time.monotonic()
+                        proc = subprocess.run(command, cwd=directory, env=env,
+                                              capture_output=True, text=True, timeout=180)
+                        output = directory / case
+                        output.with_suffix(".stdout").write_text(proc.stdout, encoding="utf-8")
+                        output.with_suffix(".stderr").write_text(proc.stderr, encoding="utf-8")
+                        output.with_suffix(".receipt.json").write_text(json.dumps({
+                            "command": command, "exit": proc.returncode,
+                            "seconds": time.monotonic() - started,
+                            "sources": {name: hashlib.sha256(source.encode()).hexdigest()
+                                        for name, source, _line in programs},
+                            "runner": hashlib.sha256(runner.read_bytes()).hexdigest(),
+                            "sql_helper": hashlib.sha256((runner.parent / "modules/helpers/ubs_core/analyzers/sec_sql_injection.py").read_bytes()).hexdigest(),
+                        }, indent=2), encoding="utf-8")
+                        context = f"{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+                        report = json.loads(proc.stdout)
+                        if format_ == "json":
+                            self.assertEqual(report["status"], "ok", context)
+                            actual = sorted((Path(row["file"]).name, row["line"], row["severity"])
+                                            for row in report.get("findings", [])
+                                            if row["rule_id"] == "js.security.sql-injection")
+                            retained = sorted((Path(row["file"]).name, row["line"], row["severity"])
+                                              for row in report.get("findings", [])
+                                              if row["rule_id"] == "javascript.taint.sql")
+                            self.assertEqual(retained, companion, context)
+                            self.assertEqual(report["totals"]["critical"], len(expected) + len(companion), context)
+                        else:
+                            all_rows = [row for run in report["runs"] for row in run.get("results", [])]
+                            rows = [row for row in all_rows if row["ruleId"] == "js.security.sql-injection"]
+                            actual = sorted((sarif_location_path(row["locations"][0]["physicalLocation"]["artifactLocation"]["uri"], directory).name,
+                                             row["locations"][0]["physicalLocation"]["region"]["startLine"], "critical")
+                                            for row in rows if row["level"] == "error")
+                            retained = sorted((sarif_location_path(row["locations"][0]["physicalLocation"]["artifactLocation"]["uri"], directory).name,
+                                               row["locations"][0]["physicalLocation"]["region"]["startLine"], "critical")
+                                              for row in all_rows
+                                              if row["ruleId"] == "javascript.taint.sql" and row["level"] == "error")
+                            self.assertEqual(retained, companion, context)
+                            self.assertEqual(sum(row["level"] == "error" for row in all_rows),
+                                             len(expected) + len(companion), context)
+                            self.assertTrue(all(item.get("executionSuccessful") is not False
+                                                for run in report["runs"] for item in run.get("invocations", [])), context)
+                        self.assertEqual(actual, expected, context)
+                        self.assertEqual(proc.returncode, int(bool(expected or companion)), context)
+                        print(f"[drizzle-{case}] PASS {time.monotonic() - started:.3f}s", flush=True)
+
+
+class DrizzleBoundSqlUncertainBindingsTests(unittest.TestCase):
+    """Unknown raw fragments and shadowed tags retain the incumbent finding."""
+
+    def test_opaque_interpolations_and_rebound_providers_remain_reported(self):
+        from ubs_core.analyzers import sec_sql_injection
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "drizzle-bound-sql"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(prefix="uncertain-", dir=artifacts))
+        cases = {
+            "computed-raw": ('import { sql } from "drizzle-orm";',
+                             'return db.execute(sql["raw"]("SELECT id FROM records WHERE id = " + value));'),
+            "constructor": ('import { SQL, sql } from "drizzle-orm";',
+                            'const fragment = new SQL([value]); return db.execute(sql`SELECT id FROM records WHERE ${fragment}`);'),
+            "aliased-constructor": ('import { SQL as Fragment, sql } from "drizzle-orm";',
+                                    'const fragment = new Fragment([value]); return db.execute(sql`SELECT id FROM records WHERE ${fragment}`);'),
+            "opaque-builder": ('import { sql } from "drizzle-orm";',
+                               'return db.execute(sql`SELECT id FROM records WHERE ${makeClause(value)}`);'),
+            "catch-shadow": ('import { sql } from "drizzle-orm";',
+                             'try { throw value; } catch (sql) { return db.execute(sql`SELECT id FROM records WHERE ${value}`); }'),
+        }
+        for name, (imports, sink) in cases.items():
+            with self.subTest(case=name):
+                source = (imports + '\nexport async function run(req: RequestContext) {\n'
+                          '  const value = req.body.value;\n  ' + sink + '\n}\n')
+                path = directory / (name + '.ts')
+                path.write_text(source, encoding="utf-8")
+                findings = list(sec_sql_injection.scan_file_findings(path))
+                reason = ('request-derived SQL variable fragment reaches execution'
+                          if name in {"constructor", "aliased-constructor"}
+                          else 'request-derived SQL reaches raw execution')
+                self.assertEqual([(line, message) for line, _sample, message in findings],
+                                 [(4, reason)], findings)
+
+
+class PlaywrightMetadataAndEqualityPrecisionTests(unittest.TestCase):
+    """Real source scans: public metadata is distinct from secrets and writes.
+
+    UBS_JS_INCUMBENT_HELPERS enables the release comparison against an actual
+    installed incumbent in the same invocation. Candidate assertions always run.
+    All inputs and receipts are retained under the permitted artifact directory.
+    """
+
+    HEADER = '''import { test } from "@playwright/test";
+async function unrelatedLogin(credentials) {
+  const response = await auth.signInWithPassword(credentials);
+  const result = await auth.signInWithPassword(credentials);
+  return [response, result];
+}
+'''
+
+    def setUp(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "response-metadata-precision"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.directory = Path(tempfile.mkdtemp(prefix="probe-", dir=artifacts))
+
+    def response_program(self, expression, *, before="", after="", name="response", header=None):
+        return ((self.HEADER if header is None else header)
+                + 'test("reader", async ({ page }) => {\n' + before
+                + '  const completed = page.waitForResponse(\n'
+                + '    (' + name + ') =>\n      ' + expression + '\n  );\n'
+                + after + '});\n')
+
+    def compare(self, cases, analyzer):
+        from ubs_core.analyzers import ctcompare_js, sec_prototype_pollution
+
+        observations = []
+        incumbent = os.environ.get("UBS_JS_INCUMBENT_HELPERS")
+        for label, source, expected, classification in cases:
+            path = self.directory / (label + ".ts")
+            with path.open("x", encoding="utf-8") as output:
+                output.write(source)
+            if analyzer == "secret":
+                findings = ctcompare_js.scan_file(path, self.directory)
+                lines = [row[1] for row in findings]
+            else:
+                lines = list(sec_prototype_pollution.scan_file_findings(path))
+            self.assertEqual(len(lines), expected, (label, lines, source))
+            row = {"case": label, "classification": classification,
+                   "expected": expected, "candidate_lines": lines,
+                   "source_sha256": hashlib.sha256(source.encode()).hexdigest()}
+            if incumbent:
+                program = (
+                    "from pathlib import Path;import json;"
+                    "from ubs_core.analyzers import ctcompare_js,sec_prototype_pollution;"
+                    "p=Path(" + repr(str(path)) + ");"
+                    + ("print(json.dumps([r[1] for r in ctcompare_js.scan_file(p,p.parent)]))"
+                       if analyzer == "secret" else
+                       "print(json.dumps(list(sec_prototype_pollution.scan_file_findings(p))))")
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", program], cwd=self.directory,
+                    env=dict(os.environ, PYTHONPATH=incumbent),
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                previous = json.loads(result.stdout)
+                row["incumbent_lines"] = previous
+                if classification in {"unsafe", "conservative"}:
+                    # Preserve the exact locations, not merely a total which
+                    # could hide one lost secret/write behind another finding.
+                    self.assertEqual(lines, previous, (label, row))
+                if classification == "mixed":
+                    unsafe_lines = [index for index, line in enumerate(source.splitlines(), 1)
+                                    if "=== expectedAuthToken" in line]
+                    self.assertEqual(lines, unsafe_lines, (label, row))
+                    self.assertTrue(set(unsafe_lines).issubset(previous), (label, row))
+            observations.append(row)
+        helper = (HELPERS_DIR / "ubs_core" / "analyzers" /
+                  ("ctcompare_js.py" if analyzer == "secret" else "sec_prototype_pollution.py"))
+        receipt = {"analyzer": analyzer, "cases": observations,
+                   "candidate_helper_sha256": hashlib.sha256(helper.read_bytes()).hexdigest()}
+        if incumbent:
+            previous_helper = Path(incumbent) / "ubs_core" / "analyzers" / helper.name
+            receipt["incumbent_helper_sha256"] = hashlib.sha256(previous_helper.read_bytes()).hexdigest()
+        (self.directory / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+        print(json.dumps({"analyzer": analyzer, "cases": len(cases),
+                          "paired": bool(incumbent), "receipt": str(self.directory / "receipt.json")}),
+              flush=True)
+
+    def test_public_http_metadata_retains_secret_and_unknown_receiver_checks(self):
+        public = self.response_program
+        cases = [
+            ("method", public('response.request().method() === "POST"'), 0, "public"),
+            ("route", public('new URL(response.url()).pathname === targetRoute'), 0, "public"),
+            ("reverse-method", public('"POST" === response.request().method()'), 0, "public"),
+            ("wrapped-method", public('(response.request().method()) === "PUT"'), 0, "public"),
+            ("other-binding", public('result.request().method() === "POST"', name="result"), 0, "public"),
+            ("method-and-route", public('response.request().method() === "POST" &&\n'
+                                       '      new URL(response.url()).pathname === targetRoute'), 0, "public"),
+            ("secret-content", public('response.request().headers().authorization === expectedAuthToken'), 1, "unsafe"),
+            ("secret-right-operand", public('response.request().method() === expectedAuthToken'), 1, "unsafe"),
+            ("secret-in-same-boolean", public('response.request().method() === "POST" &&\n'
+                                             '      actualAuthToken === expectedAuthToken'), 1, "mixed"),
+            ("outer-secret-alias", public('response.request().method() === "POST"',
+                                          before='  const response = actualAuthToken;\n',
+                                          after='  return response === expectedAuthToken;\n'), 1, "mixed"),
+            ("page-rebound", public('response.request().method() === "POST"',
+                                    before='  page = customPage;\n'), 1, "conservative"),
+            ("response-rebound", public('{ response = actualAuthToken;\n'
+                                        '      return response.request().method() === expected; }'), 1, "conservative"),
+            ("url-shadowed", public('new URL(response.url()).pathname === targetRoute',
+                                    before='  const URL = customConstructor;\n'), 1, "conservative"),
+            ("url-imported", public('new URL(response.url()).pathname === targetRoute',
+                                    header=self.HEADER + 'import { URL } from "custom-url";\n'), 1, "conservative"),
+            ("unknown-provider", public('response.request().method() === "POST"',
+                                        header='import { test } from "custom-tests";\n' + self.HEADER.split('\n', 1)[1]), 1, "conservative"),
+            ("untrusted-nested-page", self.HEADER + '''test("reader", async ({ page }) => {
+  function check(page) {
+    return page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST"
+    );
+  }
+});
+''', 1, "conservative"),
+            ("shadowed-nested-response", public('''{
+      const check = (response) =>
+        response.request().method() === "POST";
+      return check(customResponse);
+    }'''), 1, "conservative"),
+            ("same-line-outer-secret", self.HEADER + '''test("reader", async ({ page }) => {
+  const response = actualAuthToken;
+  page.waitForResponse((response) => response.request().method() === "POST"); return response === expectedAuthToken;
+});
+''', 1, "mixed"),
+            ("inline-public-callback", self.HEADER + '''test("reader", async ({ page }) => {
+  page.waitForResponse((response) => response.request().method() === "POST");
+});
+''', 0, "public"),
+            ("actual-secret-equality", self.HEADER + '''function verify(actualAuthToken, expectedAuthToken) {
+  return actualAuthToken === expectedAuthToken;
+}
+''', 1, "unsafe"),
+            ("timing-safe-secret-check", self.HEADER + '''function verify(actualAuthToken, expectedAuthToken) {
+  return crypto.timingSafeEqual(Buffer.from(actualAuthToken), Buffer.from(expectedAuthToken));
+}
+''', 0, "public"),
+        ]
+        self.compare(cases, "secret")
+
+    def test_computed_reads_retain_real_property_writes_and_merges(self):
+        header = '''function inspect(request, expected) {
+  const rows = request.body.rows;
+  const key = request.body.key;
+  const target = {};
+'''
+        cases = []
+        for label, statement, expected, classification in [
+            ("strict-read", 'return rows.find(entry => entry[0] === expected);', 0, "public"),
+            ("loose-read", 'return rows.find(entry => entry[0] == expected);', 0, "public"),
+            ("not-equal-read", 'return rows.find(entry => entry[0] !== expected);', 0, "public"),
+            # The incumbent emits both the enclosing function's bounded
+            # lookahead and the sink line. Keep both exact locations here.
+            ("direct-write", 'target[key] = request.body.value;', 2, "unsafe"),
+            ("trivia-write", 'target /* receiver */ [key] /* assignment */ = request.body.value;', 2, "unsafe"),
+            ("callable-write", 'target[key] = () => request.body.value;', 2, "unsafe"),
+            ("merge", 'return Object.assign(target, request.body);', 2, "unsafe"),
+            ("read-and-write", 'return rows.find(entry => entry[0] === expected && (target[key] = request.body.value));', 2, "unsafe"),
+        ]:
+            cases.append((label, header + '  ' + statement + '\n}\n', expected, classification))
+        self.compare(cases, "prototype")
+
+
 if __name__ == "__main__":
     unittest.main()

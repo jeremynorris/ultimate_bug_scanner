@@ -49,7 +49,7 @@ DYNAMIC_WRITE_RE = re.compile(
     r'(?:(?<![\w$])(?!(?:const|let|var|return|yield)\b)'
     r'[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*|[)\]])'
     + COMPUTED_RECEIVER_TRIVIA + r'(?:!' + COMPUTED_RECEIVER_TRIVIA + r')*'
-    r'\[[^\]]+\]' + COMPUTED_RECEIVER_TRIVIA + r'='
+    r'\[[^\]]+\]' + COMPUTED_RECEIVER_TRIVIA + r'=(?!=|>)'
 )
 ASSIGN_RE = re.compile(
     r'^\s*(?:const|let|var)?\s*([A-Za-z_$][\w$]*)\s*(?::[^=;]+)?=\s*(.+)'

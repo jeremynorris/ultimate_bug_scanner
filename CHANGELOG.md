@@ -10,6 +10,21 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+### JavaScript precision (5.5.27)
+
+- Playwright response predicates compare public HTTP methods and route paths
+  without inheriting secret taint from unrelated variables with the same name.
+  The model requires the actual test/page fixture binding and retains secret
+  content comparisons, rebound receivers, shadowed constructors and unknown
+  callback provenance.
+- Computed equality reads using `==` or `===` no longer count as prototype
+  property writes. Actual computed assignments and request-derived object
+  merges remain critical.
+- Paired incumbent/candidate checks cover 29 source programs; the actual
+  CommunitAI authentication/voting test source no longer emits its 22 false
+  critical metadata/equality diagnostics. These are precision corrections,
+  not a calibrated security-coverage score.
+
 ### Added
 
 - Elixir error handling now follows non-bang File results through local helpers,

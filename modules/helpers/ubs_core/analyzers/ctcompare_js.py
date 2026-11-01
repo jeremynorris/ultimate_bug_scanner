@@ -17,6 +17,7 @@ from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import SourceSuppressions
+from ubs_core.lexer import javascript_lexical_views
 
 exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
@@ -447,8 +448,87 @@ def comparison_operands(statement: str) -> Iterable[tuple[int, str, str]]:
             yield comparison.start(), left, right
 
 
+def playwright_response_ranges(text):
+    """Public metadata of real, unrebound Playwright response callback bindings.
+
+    File-wide alias names are not proof that a callback's Response is a secret.
+    Keep that conservative taint for its contents; only method/route metadata
+    gets a scoped exception, with fixture provenance and no shadowed URL.
+    """
+    source, code = javascript_lexical_views(text)
+    imports = re.finditer(
+        r'\bimport\s*\{([^}]+)\}\s*from\s*([\'"])@playwright/test\2', source
+    )
+    if not any(code[match.start():match.start() + 6] == 'import'
+               and 'test' in (name.strip() for name in match.group(1).split(','))
+               for match in imports):
+        return []
+    from ubs_core.analyzers.taint_js import _function_scopes
+
+    _root, scopes = _function_scopes(source, code)
+    shadowed_url = bool(re.search(
+        r'\b(?:const|let|var|class|function)\s+URL\b|\bURL\s*=(?!=)'
+        r'|\bimport\b[^;]*\bURL\b', code
+    )) or any('URL' in names for scope in scopes for names, *_ in scope.params)
+    ranges = []
+    for scope in scopes:
+        if len(scope.params) != 1:
+            continue
+        names, rest, default, _span = scope.params[0]
+        if len(names) != 1 or rest or default is not None:
+            continue
+        name = names[0]
+        call = re.search(r'\b([A-Za-z_$][\w$]*)\s*\.\s*waitForResponse\s*\(\s*$',
+                         code[max(0, scope.start - 256):scope.start])
+        if not call:
+            continue
+        receiver = call.group(1)
+        parent = scope.parent
+        fixture = None
+        while parent:
+            prefix = code[max(0, parent.start - 512):parent.start]
+            # Test callbacks receive the actual page fixture. Ordinary helpers
+            # or similarly named methods do not establish this provenance.
+            if any(receiver in bindings for bindings, *_ in parent.params):
+                if (receiver in parent.params[0][0]
+                        and re.search(r'\btest\s*\([^;]*,\s*$', prefix)):
+                    fixture = parent
+                break
+            parent = parent.parent
+        if fixture is None:
+            continue
+        if (re.search(rf'\b{re.escape(receiver)}\s*=(?!=|>)',
+                      code[fixture.body_start:fixture.body_end])
+                or re.search(rf'\b{re.escape(name)}\s*=(?!=|>)',
+                             code[scope.body_start:scope.body_end])):
+            continue
+        # A nested function can shadow the Response parameter. Its body is not
+        # evidence about the surrounding callback's public metadata.
+        cursor = scope.body_start
+        for child in sorted(scope.children, key=lambda item: item.start):
+            ranges.append((cursor, child.start, name, not shadowed_url, scope.body_start))
+            cursor = child.end
+        ranges.append((cursor, scope.body_end, name, not shadowed_url, scope.body_start))
+    return ranges
+
+
+def response_metadata_read(operand, names, path_names):
+    operand = operand.strip().removesuffix(';').strip()
+    operand = re.sub(r'^(?:return|yield)\s+', '', operand)
+    operand = re.sub(r'^(?:if|while)\s*\(', '(', operand)
+    for name in names:
+        root = re.escape(name)
+        if re.fullmatch(rf'\(*\s*{root}\s*\.\s*request\s*\(\s*\)\s*\.\s*method\s*\(\s*\)\s*\)*', operand):
+            return True
+        if name in path_names and re.fullmatch(
+                rf'\(*\s*new\s+URL\s*\(\s*{root}\s*\.\s*url\s*\(\s*\)\s*\)\s*\.\s*pathname\s*\)*', operand):
+            return True
+    return False
+
+
 def unsafe_secret_compare(statement, sensitive_vars, *, call_results=frozenset(),
-                          comparison_start=0, comparison_limit=None):
+                          comparison_start=0, comparison_limit=None,
+                          response_ranges=(), source_offset=0):
     if safe_compare_re.search(statement):
         return False
     # Match within each term, never across &&/||. An exempt comparison only
@@ -458,7 +538,20 @@ def unsafe_secret_compare(statement, sensitive_vars, *, call_results=frozenset()
             continue
         if comparison_limit is not None and offset >= comparison_limit:
             continue
-        if unsafe_secret_operands(left, right, sensitive_vars, call_results):
+        public = [(name, paths, body) for start, end, name, paths, body in response_ranges
+                  if start <= source_offset + offset < end]
+        for name, paths, body in public:
+            # A concise callback may share the comparison's physical line.
+            # Recover its operand from the real body boundary, rather than
+            # treating the call/arrow prefix as part of the compared value.
+            if source_offset < body <= source_offset + offset:
+                callback_left = statement[body - source_offset:offset]
+                if response_metadata_read(callback_left, {name}, {name} if paths else set()):
+                    left = callback_left
+                    break
+        if unsafe_secret_operands(left, right, sensitive_vars, call_results,
+                                  frozenset(name for name, _, _ in public),
+                                  frozenset(name for name, paths, _ in public if paths)):
             return True
     return False
 
@@ -468,7 +561,10 @@ def operand_tainted(operand, sensitive_vars, call_results=frozenset()):
             and not call_result_metadata_read(operand, call_results))
 
 
-def unsafe_secret_operands(left, right, sensitive_vars, call_results=frozenset()):
+def unsafe_secret_operands(left, right, sensitive_vars, call_results=frozenset(),
+                           response_names=frozenset(), path_names=frozenset()):
+    left_metadata = response_metadata_read(left, response_names, path_names)
+    right_metadata = response_metadata_read(right, response_names, path_names)
     left = clean_operand_text(left)
     right = clean_operand_text(right)
     if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
@@ -476,8 +572,10 @@ def unsafe_secret_operands(left, right, sensitive_vars, call_results=frozenset()
 
     left_fams = sensitive_families(left)
     right_fams = sensitive_families(right)
-    left_taint = operand_tainted(left, sensitive_vars, call_results)
-    right_taint = operand_tainted(right, sensitive_vars, call_results)
+    left_taint = (operand_tainted(left, sensitive_vars, call_results)
+                  and not left_metadata)
+    right_taint = (operand_tainted(right, sensitive_vars, call_results)
+                   and not right_metadata)
     left_sensitive = bool(left_fams) or left_taint
     right_sensitive = bool(right_fams) or right_taint
 
@@ -515,6 +613,12 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
     # view only for this file; the shared index owns suppression separately.
     code_lines = [code_line(raw) for raw in lines]
     sensitive_vars, call_results = collect_sensitive_bindings(lines, code_lines)
+    response_ranges = playwright_response_ranges(text)
+    line_offsets = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        line_offsets.append(offset)
+        offset += len(line)
     seen_lines = set()
     for idx, code in enumerate(code_lines):
         stripped = code.strip()
@@ -533,7 +637,9 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
         # physical line must be reported there, not on this line as well.
         if not statement or not unsafe_secret_compare(
             statement, sensitive_vars, call_results=call_results,
-            comparison_start=len(prefix), comparison_limit=len(prefix) + len(stripped)
+            comparison_start=len(prefix), comparison_limit=len(prefix) + len(stripped),
+            response_ranges=response_ranges,
+            source_offset=line_offsets[idx] + len(lines[idx]) - len(lines[idx].lstrip()) - len(prefix)
         ):
             continue
         if idx in seen_lines or source_index.is_suppressed(idx + 1, _RULE):
