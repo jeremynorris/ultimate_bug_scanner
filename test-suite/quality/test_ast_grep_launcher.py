@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -174,11 +176,13 @@ class AstGrepLauncher(unittest.TestCase):
         # before any module can invoke the unsafe launcher, even on a Python scan.
         tools = self.root / 'tools'
         tools.mkdir()
+        native_mkdir = shutil.which('mkdir', path=os.defpath)
+        self.assertIsNotNone(native_mkdir, 'native mkdir is required for fault injection')
         mkdir = tools / 'mkdir'
         mkdir.write_text(
             '#!/bin/sh\n'
             'case "$*" in *ast-grep-path*) exit 71;; esac\n'
-            'exec /usr/bin/mkdir "$@"\n', encoding='utf-8',
+            f'exec {shlex.quote(native_mkdir)} "$@"\n', encoding='utf-8',
         )
         mkdir.chmod(0o755)
         target = self.root / 'clean.py'
