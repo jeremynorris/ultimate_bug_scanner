@@ -997,6 +997,186 @@ class SQLValueCaptureTests(unittest.TestCase):
                 with self.assertRaises(detector.SQLFlowLimit):
                     list(detector.find([path]))
 
+    def test_unrelated_generator_dictionary_does_not_abort_sql_scope(self):
+        helper = ('def merge(rows):\n'
+                  '    return dict.fromkeys(key for row in rows for key in row)\n')
+        reflection = ('def field(obj, name):\n'
+                      '    return getattr(obj, name)\n')
+        for label, query, expected in (
+                ('static', '"SELECT 1"', ()),
+                ('unsafe', 'f"SELECT {user}"', ((CRITICAL, 6),))):
+            source = helper + reflection + 'def count(cursor, user):\n    cursor.execute(' + query + ')\n'
+            self.inspect('unrelated-fromkeys-' + label, source, expected)
+
+    def test_referenced_dictionary_helpers_keep_callback_refusal(self):
+        helper = ('def merge(rows):\n'
+                  '    return dict.fromkeys(key for row in rows for key in row)\n')
+        for name, use in (
+                ('direct', '    merge(rows)\n'),
+                ('alias', '    collect = merge\n    collect(rows)\n'),
+                ('callback', '    process(merge, rows)\n')):
+            source = helper + 'def count(cursor, rows):\n' + use + '    cursor.execute("SELECT 1")\n'
+            path = self.artifacts / ('referenced-fromkeys-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(reference=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'fromkeys key callbacks.*incomplete'):
+                list(detector.find([path]))
+
+    def test_unrelated_dictionary_body_keeps_eager_default_sink(self):
+        source = ('def merge(rows, default=cursor.execute(f"SELECT {source()}")):\n'
+                  '    return dict.fromkeys(key for row in rows for key in row)\n')
+        self.inspect('fromkeys-eager-definition', source, ((CRITICAL, 1),))
+
+    def test_finite_attribute_names_do_not_invalidate_dictionary_binding(self):
+        for name, lookup in (
+                ('literal-table', '    getattr(obj, {"class": "classes", "function": "functions"}[kind])\n'),
+                ('stable-name', '    field = {"class": "classes", "function": "functions"}[kind]\n'
+                 '    getattr(obj, field)\n'),
+                ('tuple', '    getattr(obj, ("classes", "functions")[kind])\n'),
+                ('concatenation', '    getattr(obj, "class" + "es")\n'),
+                ('unrelated-function', '')):
+            prefix = ('def field(obj, name):\n    return getattr(obj, name)\n'
+                      if name == 'unrelated-function' else '')
+            for label, query in (('safe', '"SELECT 1"'), ('unsafe', 'f"SELECT {user}"')):
+                source = (prefix + 'def run(cursor, user, obj, kind):\n' + lookup
+                          + '    mapping = dict.fromkeys("chosen" for item in [1])\n'
+                          + f'    cursor.execute({query})\n')
+                line = len(source.splitlines())
+                with self.subTest(lookup=name, value=label):
+                    self.inspect('fromkeys-lookup-' + name + '-' + label, source,
+                                 ((CRITICAL, line),) if label == 'unsafe' else ())
+
+    def test_unknown_or_namespace_attribute_names_keep_binding_refusal(self):
+        for name, lookup in (
+                ('unknown', '    getattr(obj, field)\n'),
+                ('namespace-concatenation', '    getattr(obj, "f_" + "builtins")\n'),
+                ('namespace-table', '    getattr(obj, {0: "classes", 1: "f_builtins"}[field])\n'),
+                ('rebound', '    field = "classes"\n    field = source()\n    getattr(obj, field)\n'),
+                ('conditional', '    if user:\n        field = "classes"\n    getattr(obj, field)\n'),
+                ('alias', '    lookup = getattr\n    lookup(obj, field)\n')):
+            source = ('def run(cursor, user, obj, field):\n' + lookup
+                      + '    mapping = dict.fromkeys("chosen" for item in [1])\n'
+                      + '    cursor.execute("SELECT 1")\n')
+            path = self.artifacts / ('fromkeys-dynamic-lookup-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(lookup=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'fromkeys binding.*incomplete'):
+                list(detector.find([path]))
+
+    def test_finite_attribute_table_does_not_hide_selector_callbacks(self):
+        for name, setup, selector, table in (
+                ('hash', '    class Key:\n        def __hash__(self):\n'
+                 '            nonlocal query\n            query = f"SELECT {user}"\n'
+                 '            return hash("field")\n'
+                 '        def __eq__(self, other):\n            return True\n',
+                 'Key()', '{"field": "value"}'),
+                ('equality', '    class Key:\n        def __hash__(self):\n            return hash("field")\n'
+                 '        def __eq__(self, other):\n            nonlocal query\n'
+                 '            query = f"SELECT {user}"\n            return True\n',
+                 'Key()', '{"field": "value"}'),
+                ('index', '    class Key:\n        def __index__(self):\n            nonlocal query\n'
+                 '            query = f"SELECT {user}"\n            return 0\n',
+                 'Key()', '("value",)'),
+                ('imported', '    from callbacks import Key\n', 'Key()', '{"field": "value"}'),
+                ('aliased', '    from callbacks import Key as Selector\n    chosen = Selector()\n',
+                 'chosen', '{"field": "value"}')):
+            source = ('def run(cursor, user, obj):\n    query = "SELECT 1"\n' + setup
+                      + f'    field = {table}[{selector}]\n    getattr(obj, field)\n'
+                      + '    mapping = dict.fromkeys("chosen" for item in [1])\n'
+                      + '    cursor.execute(query)\n')
+            path = self.artifacts / ('attribute-selector-callback-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(callback=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, 'fromkeys binding.*incomplete'):
+                list(detector.find([path]))
+
+    def test_local_execute_and_scalar_are_not_database_operations(self):
+        source = ('def scalar(value):\n    return value\n'
+                  'class Engine:\n'
+                  '    def execute(self, statement):\n        return scalar(statement)\n'
+                  '    def run(self, user):\n        return self.execute(f"SELECT {user}")\n')
+        self.inspect('local-execute-only', source, ())
+        self.inspect('local-execute-next-to-db', source
+                     + 'def count(cursor, user):\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 9),))
+
+    def test_local_sql_wrappers_retain_callsite_findings(self):
+        for name, prefix, body in (
+                ('direct', '', '        return self.cursor.execute(query)\n'),
+                ('captured', '', '        action = self.cursor.execute\n        return action(query)\n'),
+                ('imported-alias', 'from db_driver import execute as send\n', '        return send(query)\n'),
+                ('indirect', '', '        return self.forward(query)\n'
+                 '    def forward(self, query):\n        return self.cursor.execute(query)\n'),
+                ('recursive', '', '        if flag:\n            return self.forward(query)\n'
+                 '        return self.cursor.execute(query)\n'
+                 '    def forward(self, query):\n        return self.execute(query)\n'),
+                ('reflected', '', '        return getattr(self.cursor, "execute")(query)\n'),
+                ('callback-field', '', '        return self.writer(query)\n'),
+                ('callback-alias', '', '        saved = query\n        return self.writer(saved)\n'),
+                ('callback-indirect', '', '        return self.forward(query)\n'
+                 '    def forward(self, query):\n        return self.writer(query)\n'),
+                ('imported-forwarder', 'from db_driver import send\n', '        return send(query)\n'),
+                ('constructor-capture', '', '        return self.writer(query)\n'
+                 '    def __init__(self, cursor):\n        self.writer = cursor.execute\n'),
+                ('heap-forward', '', '        self.pending = query\n        return self.writer(self.pending)\n'),
+                ('heap-formatted', '', '        self.pending = f"{query}"\n        return self.writer(self.pending)\n'),
+                ('heap-converted', '', '        self.pending = str(query)\n        return self.writer(self.pending)\n'),
+                ('heap-unpacked', '', '        self.pending, = (query,)\n        return self.writer(self.pending)\n'),
+                ('heap-helper-result', 'def wrap(value):\n    return value\n',
+                 '        self.pending = wrap(query)\n        return self.writer(self.pending)\n'),
+                ('heap-augmented', '', '        self.pending += query\n        return self.writer(self.pending)\n'),
+                ('bound-str-alias', '', '        transform = query.__str__\n        return self.writer(transform())\n'),
+                ('bound-strip-alias', '', '        transform = query.strip\n        return self.writer(transform())\n'),
+                ('bound-transitive-alias', '', '        transform = query.strip\n        action = transform\n'
+                 '        return self.writer(action())\n'),
+                ('bound-container-alias', '', '        transforms = [query.strip]\n'
+                 '        return self.writer(transforms[0]())\n'),
+                ('closure-forward', '', '        callback = lambda: self.writer(query)\n        return callback()\n'),
+                ('remove-prefix', '', '        return self.writer(query.removeprefix("SQL:"))\n'),
+                ('encode', '', '        return self.writer(query.encode())\n'),
+                ('padding', '', '        return self.writer(query.ljust(1))\n'),
+                ('unpacked-alias', '', '        saved, = (query,)\n        return self.writer(saved)\n'),
+                ('augmented-alias', '', '        saved = ""\n        saved += query\n        return self.writer(saved)\n'),
+                ('loop-alias', '', '        for saved in [query]:\n            return self.writer(saved)\n')):
+            for label, argument in (('unsafe', 'f"SELECT {user}"'), ('static', '"SELECT 1"')):
+                source = (prefix + 'class Wrapper:\n    def execute(self, query):\n' + body
+                          + '    def run(self, user):\n        return self.execute(' + argument + ')\n')
+                line = len(source.splitlines())
+                with self.subTest(wrapper=name, value=label):
+                    self.inspect('sql-wrapper-' + name + '-' + label, source,
+                                 ((CRITICAL, line),) if label == 'unsafe' else ())
+
+    def test_dynamic_execute_dispatch_cannot_inherit_local_method_proof(self):
+        for name, source in (
+                ('inheritance', 'class Engine(Base):\n'
+                 '    def execute(self, statement):\n        return statement\n'),
+                ('descriptor', 'class Engine:\n'
+                 '    @property\n    def execute(self):\n        return db.execute\n'),
+                ('attribute-hook', 'class Engine:\n'
+                 '    def __getattribute__(self, name):\n        return lookup(name)\n'
+                 '    def execute(self, statement):\n        return statement\n'),
+                ('replacement', 'class Engine:\n'
+                 '    def execute(self, statement):\n        return statement\n'
+                 '    def replace(self, callback):\n        self.execute = callback\n'),
+                ('reflected-replacement', 'class Engine:\n'
+                 '    def execute(self, statement):\n        return statement\n'
+                 '    def replace(self, callback):\n        setattr(self, "execute", callback)\n'),
+                ('code-replacement', 'class Engine:\n'
+                 '    def execute(self, statement):\n        return statement\n'
+                 '    def replace(self, callback):\n        Engine.execute.__code__ = callback.__code__\n')):
+            source += '    def run(self, user):\n        return self.execute(f"SELECT {user}")\n'
+            with self.subTest(dispatch=name):
+                self.inspect('dynamic-execute-' + name, source, ((CRITICAL, len(source.splitlines())),))
+
+    def test_escaped_class_or_receiver_cannot_prove_local_execute(self):
+        for name, effect in (
+                ('receiver', '        replace_handler(self)\n'),
+                ('class', '        replace_handler(Engine)\n')):
+            source = ('class Engine:\n'
+                      '    def execute(self, statement):\n        return statement\n'
+                      '    def run(self, user):\n' + effect
+                      + '        return self.execute(f"SELECT {user}")\n')
+            self.inspect('escaped-execute-' + name, source, ((CRITICAL, 6),))
+
     def test_exclusive_list_consumers_preserve_sql_and_reject_aliases(self):
         cases = (
             ('extend-sql', '    queries = []\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[0])\n', ((CRITICAL, 4),)),

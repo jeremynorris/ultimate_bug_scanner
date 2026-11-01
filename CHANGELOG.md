@@ -28,6 +28,19 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   analyzer no longer needs a secret-comparison suppression for its state
   signature. Unknown signatures, secret-bearing records, mutable aliases
   and escaped receivers remain security findings.
+- Python SQL analysis separates independent deferred helpers from reachable
+  SQL effects, resolves bounded ordinary attribute-name tables, and checks
+  local `execute` wrappers before treating their names as database APIs.
+  Rebinding, namespace reflection, generator-key callbacks and unresolved
+  SQL forwarding remain conservative. The Kotlin flow analyzer can use its
+  original `execute` name again. The PHP analyzer's four eager dictionary
+  comprehensions remain until record-state writes have a sufficient heap
+  proof; restoring them must not hide callback-mediated SQL execution.
+- Reassessed the 24 v5.5.26 release suppressions from GH #195: removed six
+  I/O-loop markers and one comparison marker after detector regressions
+  passed. Retained fifteen genuine high-parameter-count findings tracked by
+  bead `8tqg`, the explicit descriptor-ownership marker, and the development
+  JSON check's intentional-failure marker.
 
 ---
 
