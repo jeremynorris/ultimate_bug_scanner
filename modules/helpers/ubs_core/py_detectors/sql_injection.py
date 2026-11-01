@@ -407,6 +407,15 @@ class SanitizerBindings:
     def class_escapes(self, owner):
         if owner in self._escaped_classes:
             return self._escaped_classes[owner]
+        if (owner.bases or owner.keywords or owner.decorator_list
+                or {'__new__', '__getattribute__', '__getattr__', '__setattr__', '__delattr__'}
+                    & self.owner_scopes[owner]['names'].keys()):
+            self._escaped_classes[owner] = True
+            return True
+        # Resolve the members from the closed class body, not from the global
+        # member-write index. A write to another record's equally named field
+        # cannot replace this instance's method if the receiver never escapes.
+        methods = {}
         for statement in owner.body:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if any(not isinstance(decorator, ast.Name)
@@ -415,6 +424,10 @@ class SanitizerBindings:
                        for decorator in statement.decorator_list):
                     self._escaped_classes[owner] = True
                     return True
+                if len(self.owner_scopes[owner]['names'].get(statement.name, ())) != 1:
+                    self._escaped_classes[owner] = True
+                    return True
+                methods[statement.name] = statement
             elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 value = statement.value
                 targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
@@ -428,6 +441,9 @@ class SanitizerBindings:
                       or isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)):
                 self._escaped_classes[owner] = True
                 return True
+        # Recursive lexical resolution during an escape check must not turn a
+        # circular alias into a receiver proof.
+        self._escaped_classes[owner] = True
         names = {owner.name}
         for statement in owner.body:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -438,15 +454,32 @@ class SanitizerBindings:
                 target = self.resolve(reference)
                 if not target or target[0] not in {'class', 'receiver'} or target[1] is not owner:
                     continue
+                scope = self.scope_of.get(reference) if target[0] == 'receiver' else None
+                while scope is not None and scope['parent'] is not self.owner_scopes[owner]:
+                    if isinstance(scope['node'], (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        escaped = True
+                        break
+                    if (isinstance(scope['node'], ast.GeneratorExp)
+                            and not self.closed_receiver_generator(scope['node'], owner)):
+                        escaped = True
+                        break
+                    scope = scope['parent']
+                if escaped:
+                    break
                 parent = self.parents.get(reference)
                 if isinstance(parent, ast.Attribute) and parent.value is reference:
-                    # Only a known local method used directly keeps the
-                    # receiver closed. Opaque/decorated descriptors and
-                    # exported attributes can expose it without a self arg.
-                    member = self.resolve(parent)
-                    if (member and member[0] == 'function' and parent in self.direct_callees
-                            and (member[2] or [call_name(value) for value in member[1].decorator_list]
-                                 == ['staticmethod'])):
+                    method = methods.get(parent.attr)
+                    decorators = [call_name(value) for value in method.decorator_list] if method else []
+                    if (method is not None and parent in self.direct_callees
+                            and (decorators in (['staticmethod'], ['classmethod'])
+                                 or target[0] == 'receiver' and target[2])):
+                        continue
+                    if (method is None and target[0] == 'receiver' and target[2]
+                            and not parent.attr.startswith('__')):
+                        # Plain instance fields have no descriptor dispatch.
+                        # This proves only that reading/writing the field does
+                        # not export its owner; the value may still carry SQL,
+                        # aliases or an opaque callback, checked separately.
                         continue
                     escaped = True
                     break
@@ -470,6 +503,62 @@ class SanitizerBindings:
                 break
         self._escaped_classes[owner] = escaped
         return escaped
+
+    def closed_receiver_generator(self, generator, owner):
+        """A receiver capture stays private only during an eager consumption."""
+        call = self.parents.get(generator)
+        if (not isinstance(call, ast.Call) or generator not in call.args
+                or any(isinstance(value, ast.Starred) for value in call.args)
+                or any(keyword.arg is None for keyword in call.keywords)):
+            return False
+        target = self.resolve(call.func)
+        consumers = {'list', 'tuple', 'set', 'frozenset', 'dict', 'sorted', 'sum', 'min', 'max', 'any', 'all'}
+        if target and target[0] == 'unbound' and target[1] in consumers:
+            return len(call.args) == 1 and not call.keywords
+        if not target or target[0] != 'function' or not self.eager_function(target[1]):
+            return False
+        function = target[1]
+        enclosing = self.owner_scopes[function]['parent']
+        if enclosing is not None and isinstance(enclosing['node'], ast.ClassDef):
+            if enclosing['node'] is not owner:
+                return False
+        elif (function.decorator_list or any(reference not in self.direct_callees
+                and (resolved := self.resolve(reference)) and resolved[0] == 'function'
+                and resolved[1] is function for reference in self.name_loads.get(function.name, ()))):
+            # An eager-looking body is no guarantee about a decorator or an
+            # exported callable whose code can retain the generator frame.
+            return False
+        parameters = _positional_parameters(function)[1 if target[2] else 0:]
+        position = call.args.index(generator)
+        if (position >= len(parameters) or function.args.vararg or function.args.kwarg
+                or any(keyword.arg == parameters[position] for keyword in call.keywords)):
+            return False
+        for reference in self.name_loads.get(parameters[position], ()):
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL receiver capture budget exceeded; analysis is incomplete')
+            scope = self.scope_of.get(reference)
+            while scope is not None and isinstance(scope['node'], (ast.ListComp, ast.SetComp, ast.DictComp)):
+                scope = scope['parent']
+            if scope is not self.owner_scopes[function]:
+                # Capturing the parameter in another deferred scope can
+                # retain the generator and, through its frame, the receiver.
+                cursor = scope
+                while cursor is not None and cursor is not self.owner_scopes[function]:
+                    cursor = cursor['parent']
+                if cursor is not None:
+                    return False
+                continue
+            parent = self.parents.get(reference)
+            if (isinstance(parent, ast.For) and parent.iter is reference
+                    or isinstance(parent, ast.comprehension) and parent.iter is reference
+                    and not isinstance(self.parents.get(parent), ast.GeneratorExp)):
+                continue
+            if (isinstance(parent, ast.Call) and parent.args == [reference] and not parent.keywords
+                    and self.resolve(parent.func) in {('unbound', name) for name in consumers}):
+                continue
+            return False
+        return True
 
     def forwards_to_unknown(self, function, bound):
         """Refuse a non-SQL certificate when the SQL slot escapes to a callback.

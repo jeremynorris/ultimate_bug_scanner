@@ -38,6 +38,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   one-argument consumer can borrow a still-private list until exhaustion.
   Unknown hash/equality callbacks and unproved record keys remain incomplete.
 
+- Python SQL analysis distinguishes ordinary data fields on a closed local
+  application object from exports of the receiver. Local `execute` methods
+  that maintain counters no longer become SQL sinks merely because they
+  touch fields. Method replacement, descriptors, foreign receivers and SQL
+  forwarded through fields remain conservative. Receiver captures in
+  generators require a verified eager consumer; decorated or retaining
+  consumers cannot inherit that proof.
+
 - Python's I/O-in-loop rule checks that a candidate call actually repeats.
   Comments, loop-like identifier text, one write around a generator argument,
   and proven buffered EOF drains no longer produce performance warnings.

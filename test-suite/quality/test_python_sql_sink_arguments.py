@@ -63,6 +63,8 @@ CASES = (
     ("fromkeys-tuple-default", 'def run(cursor, user):\n    queries = dict.fromkeys(((name, index) for name, index in [("users", 1)]), f"SELECT {user}")\n    cursor.execute(queries[("users", 1)])\n', ((CRITICAL, 3),)),
     ("fromkeys-tuple-bound", 'def run(cursor, user):\n    queries = dict.fromkeys(((name, index) for name, index in [("users", 1)]), "SELECT ?")\n    cursor.execute(queries[("users", 1)], (user,))\n', ()),
     ("fromkeys-nested-tuple", 'def run(cursor, user):\n    keys = dict.fromkeys(key for key in ((("users", 1), None),))\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 3),)),
+    ("application-method-fields", 'class Runner:\n    def __init__(self):\n        self.count = 0\n    def execute(self, query):\n        self.count += 1\n        return len(query) + self.count\n    def run(self, user):\n        return self.execute(f"SELECT {user}")\n', ()),
+    ("application-method-field-sql", 'from backend import run_query\nclass Runner:\n    def execute(self, query):\n        self.saved = query\n        return run_query(self.saved)\n    def run(self, user):\n        return self.execute(f"SELECT {user}")\n', ((CRITICAL, 7),)),
     ("keyword-alias", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    cursor.execute(query=query)\n', ((CRITICAL, 3),)),
     ("multiline", 'def run(cursor, user):\n    cursor.execute(\n        query=f"SELECT {user}"\n    )\n', ((CRITICAL, 2),)),
     ("bound-query", 'def run(cursor, user):\n    cursor.execute(query="SELECT * FROM users WHERE name = %s", params=(user,))\n', ()),
@@ -232,7 +234,8 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
         selected = {'loop-carried-query', 'loop-bound-values-stay-data',
                     'exception-before-literal-overwrite', 'finally-cleans-break-exit',
                     'fromkeys-mixed-primitives', 'fromkeys-tuple-default',
-                    'fromkeys-tuple-bound', 'fromkeys-nested-tuple'}
+                    'fromkeys-tuple-bound', 'fromkeys-nested-tuple',
+                    'application-method-fields', 'application-method-field-sql'}
         tools = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                  for name in ('ubs', 'modules/ubs-python.sh',
                               'modules/helpers/ubs_core/py_detectors/sql_injection.py')}

@@ -1383,6 +1383,78 @@ class SQLValueCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(detector.SQLFlowLimit, 'consumer call effects.*incomplete'):
             list(detector.find([case]))
 
+    def test_plain_receiver_fields_do_not_imply_database_dispatch(self):
+        owner = ('class Runner:\n'
+                 '    def __init__(self):\n        self.count = 0\n'
+                 '    def execute(self, query):\n'
+                 '        self.count += 1\n        return len(query) + self.count\n'
+                 '    def read(self):\n        return self.count\n')
+        sink = '        return self.execute(f"SELECT {user}")\n'
+        self.inspect('plain-receiver-fields', owner + '    def run(self, user):\n' + sink, ())
+        eager = ('    def drain(self, values):\n        return list(values)\n'
+                 '    def run(self, user):\n'
+                 '        self.drain(self.read() for item in [1])\n')
+        self.inspect('plain-receiver-eager-generator', owner + eager + sink, ())
+        for name, effect in (
+                ('assigned-generator', '        callback = (self.read() for item in [1])\n'
+                 '        configure(callback)\n'),
+                ('opaque-generator', '        configure(self.read() for item in [1])\n'),
+                ('lambda', '        configure(lambda: self.read())\n'),
+                ('method-replacement', '        self.execute = replacement\n')):
+            source = owner + '    def run(self, user):\n' + effect + sink
+            with self.subTest(escape=name):
+                self.inspect('plain-receiver-' + name, source, ((CRITICAL, len(source.splitlines())),))
+        retaining = (owner + '    def drain(self, values):\n        configure(values)\n        return []\n'
+                     '    def run(self, user):\n        self.drain(self.read() for item in [1])\n' + sink)
+        self.inspect('plain-receiver-retained-generator', retaining, ((CRITICAL, len(retaining.splitlines())),))
+        forwarded = ('class Runner:\n'
+                     '    def execute(self, query):\n        self.pending = query\n'
+                     '        return send(self.pending)\n'
+                     '    def run(self, user):\n' + sink)
+        self.inspect('plain-receiver-field-forwarding', forwarded, ((CRITICAL, 6),))
+
+    def test_deferred_receiver_captures_need_closed_eager_consumers(self):
+        consumer = 'def consume(values):\n    for value in values:\n        pass\n'
+        owner = ('class Runner:\n    def __init__(self):\n        self.count = 0\n'
+                 '    def read(self):\n        return self.count\n'
+                 '    def execute(self, query):\n        return len(query)\n'
+                 '    def run(self, user):\n        consume(self.read() for item in [1])\n'
+                 '        return self.execute(f"SELECT count(*) FROM users WHERE name = \'{user}\'")\n')
+        self.inspect('receiver-stable-consumer', consumer + owner, ())
+        deferred = ('def consume(values):\n    return (value for value in values)\n' + owner)
+        self.inspect('receiver-deferred-iterator', deferred, ((CRITICAL, len(deferred.splitlines())),))
+        for name, prefix, escape in (
+                ('decorated', 'from backend import capture\n@capture\n', ''),
+                ('exported', '', 'configure(consume)\n'),
+                ('aliased', '', 'saved = consume\nconfigure(saved)\n')):
+            source = prefix + consumer + escape + owner
+            with self.subTest(consumer=name):
+                self.inspect('receiver-consumer-' + name, source, ((CRITICAL, len(source.splitlines())),))
+        driver = ('def capture(function):\n    def wrapped(values):\n'
+                  '        receiver = values.gi_frame.f_locals["self"]\n'
+                  '        receiver.execute = db.execute\n        return function(values)\n'
+                  '    return wrapped\n')
+        witness = (driver + '@capture\n' + consumer + owner
+                   + 'def run(cursor, params, user, rows):\n    global db\n    db = cursor\n'
+                   '    return Runner().run(user).fetchone()[0]\n')
+        self.assertEqual(sqlite_witness(self.artifacts, 'decorated-receiver-consumer', witness)['rows'], 2)
+
+    def test_collection_return_shapes_cannot_replace_fragment_provenance(self):
+        # A collection-shape summary alone is insufficient: the helper can
+        # construct the predicate internally, rather than receive SQL as an
+        # argument. Keep these findings before widening local return proofs.
+        for name, helper in (
+                ('direct', 'def split(value):\n    return [f"id = {value}"], []\n'),
+                ('indirect', 'def predicate(value):\n    return f"id = {value}"\n'
+                 'def split(value):\n    return [predicate(value)], []\n'),
+                ('opaque', 'from backend import predicate\n'
+                 'def split(value):\n    return [predicate(value)], []\n')):
+            source = (helper + 'def run(qs, user):\n    yes, no = split(user)\n'
+                      '    qs.extra(where=yes + no)\n')
+            with self.subTest(returned_contents=name):
+                self.inspect('collection-returned-fragment-' + name, source,
+                             ((CRITICAL, len(source.splitlines())),))
+
     def test_class_qualified_instance_calls_need_receiver_ownership(self):
         owner = ('class Runner:\n    def execute(self, query):\n        return len(query)\n'
                  '    def run(self, user):\n'
