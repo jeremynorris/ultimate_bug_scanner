@@ -930,6 +930,18 @@ class SQLValueCaptureTests(unittest.TestCase):
                 self.inspect('fromkeys-' + name,
                              program(f'    mapping = {constructor}\n    qs.extra(select=mapping)\n'), expected)
 
+    def test_sql_keywords_in_identifiers_do_not_create_sql_templates(self):
+        for name in ('call', 'select', 'update', 'drop', 'token'):
+            for expression in (f'1 + {name}.end()', f'f"{{{name}}}"'):
+                source = (f'def run(cursor, {name}):\n    value = {expression}\n'
+                          '    cursor.execute(value)\n')
+                with self.subTest(identifier=name, expression=expression):
+                    self.inspect('identifier-' + name + '-' + str(expression.startswith('1')), source, ())
+            source = (f'def run(cursor, {name}):\n'
+                      f'    cursor.execute(f"SELECT {{{name}}}")\n')
+            with self.subTest(sql_template=name):
+                self.inspect('identifier-real-sql-' + name, source, ((CRITICAL, 2),))
+
     def test_fromkeys_consumes_once_after_eager_default(self):
         unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
         safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'

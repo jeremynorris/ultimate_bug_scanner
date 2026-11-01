@@ -12,6 +12,10 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python's SQL detector takes syntax evidence from literal strings and tracked
+  values. Identifiers such as `call`, `select` and `update` no longer create
+  SQL templates; interpolated SQL still produces the existing findings.
+
 - Python's I/O-in-loop rule checks that a candidate call actually repeats.
   Comments, loop-like identifier text, one write around a generator argument,
   and proven buffered EOF drains no longer produce performance warnings.

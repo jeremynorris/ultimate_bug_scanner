@@ -34,7 +34,6 @@ import tokenize
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ubs_core.io import python_source_segment
 from ubs_core.suppression import SuppressionIndex, build_index, may_have_markers
 
 RULES = (
@@ -678,14 +677,11 @@ def string_parts(node):
     return parts
 
 
-def literal_sql_text(node, text):
-    parts = string_parts(node)
-    segment = python_source_segment(text, node) or ''
-    return ' '.join(parts + [segment])
-
-
-def looks_like_sql(node, text):
-    return bool(SQL_RE.search(literal_sql_text(node, text)))
+def looks_like_sql(node):
+    # Only literal text supplies SQL syntax. Identifiers such as ``call`` or
+    # ``update`` (including arithmetic like start + call.end()) are values,
+    # not SQL keywords. Aliased templates retain their ordinary flow facts.
+    return bool(SQL_RE.search(' '.join(string_parts(node))))
 
 
 def all_static_strings(node):
@@ -3180,7 +3176,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def has_sql_template(self, node):
         if node in self._evaluated_values:
             return self._evaluated_values[node][3]
-        return (looks_like_sql(node, self.text) or any(
+        return (looks_like_sql(node) or any(
             self._evaluated_values[child][3] if child in self._evaluated_values else
             isinstance(child, ast.Name) and child.id in self.sql_template_vars
             for child in self.value_nodes(node)))
