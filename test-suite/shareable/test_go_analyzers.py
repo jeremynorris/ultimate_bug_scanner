@@ -525,7 +525,7 @@ class RealGoTools(unittest.TestCase):
             path.write_text('package main\n\nimport "fmt"\n\n' +
                             f"func Check{number}() {{\n" + body * 1000 + '}\n')
             files.append(path)
-            expected.update((str(path), line, 2) for line in range(6, 1006))
+            expected.update((str(path), line) for line in range(6, 1006))
         hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
         captured = {}
         capture, which = tools.run_command_stream, shutil.which
@@ -537,6 +537,14 @@ class RealGoTools(unittest.TestCase):
                     position = output.stdout.tell()
                     captured["size"] = output.stdout.seek(0, io.SEEK_END)
                     captured["exit"] = output.returncode
+                    output.stdout.seek(position)
+                    # Native Go versions may anchor printf diagnostics at the
+                    # call or at the format directive. Compare the adapter to
+                    # the actual native report, independently of its parser.
+                    raw = b"\n".join(line for line in output.stdout.read().splitlines()
+                                     if not line.startswith(b"# "))
+                    report = json.loads(raw)
+                    captured["positions"] = [row["posn"] for row in report[MODULE]["printf"]]
                     output.stdout.seek(position)
                 yield output
 
@@ -550,7 +558,9 @@ class RealGoTools(unittest.TestCase):
         self.assertEqual(next(row["status"] for row in outcomes if row["tool"] == "go vet"), "ok")
         rows = [row for row in self.rows() if row["rule"] == "go.vet.printf"]
         self.assertEqual(len(rows), 13000)
-        self.assertEqual({(row["path"], row["line"], row["col"]) for row in rows}, expected)
+        self.assertEqual({(row["path"], row["line"]) for row in rows}, expected)
+        self.assertCountEqual([f"{row['path']}:{row['line']}:{row['col']}" for row in rows],
+                              captured["positions"])
         self.assertTrue(all(row["severity"] == "warning" and "fmt.Printf format %d" in row["message"]
                             for row in rows))
         self.assertEqual({path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}, hashes)
