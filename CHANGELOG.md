@@ -21,6 +21,8 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   and proven buffered EOF drains no longer produce performance warnings.
   Repeated I/O, uncertain stream ownership and cursor resets remain candidates;
   the existing project-wide threshold and suppression rules are unchanged.
+  Structural filtering applies to native Python; notebook code cells and Cython
+  keep their masked lexical candidates.
 - Python's constant-time comparison analyzer resolves supported local
   structural fingerprints from their receiver and method body. The C# flow
   analyzer no longer needs a secret-comparison suppression for its state
