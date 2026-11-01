@@ -114,7 +114,6 @@ class _SourceReader:
     """One bounded-chunk, physical-line reader; no whole-source allocation."""
 
     def __init__(self, path: Path, language: str):
-        # the rule matched this comment's prose; no I/O runs here — ubs:ignore[py.perf.io-in-loop]
         # A replaced source must not block in open() before the work budget
         # can apply. The preliminary check refuses devices; nonblocking open
         # and fstat also cover replacement with a FIFO after that check.

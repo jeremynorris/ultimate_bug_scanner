@@ -569,5 +569,264 @@ class HighParamCountTests(unittest.TestCase):
         '''), [2, 4, 7, 9])
 
 
+class IOLoopPrecisionTests(unittest.TestCase):
+    """GH #195: exercise the real >5 project-wide threshold on both sides."""
+
+    RULE = "py.perf.io-in-loop"
+
+    def assert_io(self, source: str, *, expected: bool) -> None:
+        block = textwrap.dedent(source).lstrip("\n").rstrip() + "\n"
+        code = block * 6
+        locations = [index for index, line in enumerate(code.splitlines(), 1)
+                     if "# io-site" in line]
+        self.assertEqual(len(locations), 6, code)
+        self.assertEqual(pattern_lines(self.RULE, code), locations if expected else [])
+
+    def test_comments_strings_and_loop_substrings_are_not_repeated_io(self) -> None:
+        cases = (
+            '''
+                def check(paths):
+                    # A replaced source must not block in open() before the work budget. # io-site
+                    for path in paths:
+                        pass
+            ''',
+            '''
+                def check():
+                    # fails (for example for a directory); fdopen(os.open(...)) can leak it. # io-site
+                    return 1
+            ''',
+            '''
+                def check():
+                    example = "for item in items: stream.read()"  # io-site
+                    return example
+            ''',
+            '''
+                def check(path):
+                    before = open(path)  # io-site
+                    return before
+            ''',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_io(source, expected=False)
+
+    def test_argument_comprehension_does_not_repeat_the_outer_write(self) -> None:
+        self.assert_io(r'''
+            def write_labels(stream, labels):
+                stream.write("\n".join(label for label in labels))  # io-site
+        ''', expected=False)
+        self.assert_io('''
+            def read_lines(path):
+                for line in open(path):  # io-site
+                    consume(line)
+        ''', expected=False)
+
+    def test_expensive_inline_operations_and_comprehensions_still_report(self) -> None:
+        cases = (
+            'for path in paths: open(path).read()  # io-site',
+            'for item in items: stream.write(item)  # io-site',
+            'while ready: stream.read(1)  # io-site',
+            'while ready: requests.get(url)  # io-site',
+            'values = [stream.read(1) for item in items]  # io-site',
+            'values = {item: stream.read() for item in items}  # io-site',
+            'for chunk in iter(lambda: stream.read(1), b""): consume(chunk)  # io-site',
+            'for item in items: stream.write("".join(value for value in item))  # io-site',
+        )
+        for statement in cases:
+            with self.subTest(statement=statement):
+                self.assert_io(f'def scan():\n    {statement}\n', expected=True)
+
+    def test_buffered_eof_reads_of_stable_opened_streams_are_not_redundant_io(self) -> None:
+        self.assert_io('''
+            def digest(path):
+                with open(path, "rb") as stream:
+                    while chunk := stream.read(128 * 1024):  # io-site
+                        consume(chunk)
+        ''', expected=False)
+        self.assert_io('''
+            from pathlib import Path
+            def count(path: Path):
+                with path.open("rb") as stream:
+                    while chunk := stream.read(65536):  # io-site
+                        if b"x" in chunk:
+                            break
+        ''', expected=False)
+        self.assert_io('''
+            from pathlib import Path
+            from typing import Sequence
+            def digest(files: Sequence[Path]):
+                for path in files:
+                    with path.open("rb") as stream:
+                        while chunk := stream.read(128 * 1024):  # io-site
+                            consume(chunk)
+        ''', expected=False)
+
+    def test_read_size_alone_does_not_exempt_repeated_work(self) -> None:
+        cases = (
+            '''
+                def read(stream):
+                    while chunk := stream.read(65536):  # io-site
+                        consume(chunk)
+            ''',
+            '''
+                def read(client):
+                    with client.open("rb") as stream:
+                        while chunk := stream.read(65536):  # io-site
+                            consume(chunk)
+            ''',
+            '''
+                def read(path):
+                    with open(path, "rb") as stream:
+                        while chunk := stream.read(65536): stream.seek(0)  # io-site
+            ''',
+            '''
+                def read(path):
+                    with open(path, "rb") as stream:
+                        alias = stream
+                        while chunk := stream.read(65536): alias.seek(0)  # io-site
+            ''',
+            '''
+                def read(path):
+                    with open(path, "rb") as stream:
+                        def rewind():
+                            stream.seek(0)
+                        while chunk := stream.read(65536): rewind()  # io-site
+            ''',
+            '''
+                def read(path, other):
+                    with open(path, "rb") as stream:
+                        while chunk := stream.read(65536): stream = other  # io-site
+            ''',
+            '''
+                def read(path):
+                    with open(path, "rb") as stream:
+                        while chunk := stream.read(65536): consume(stream)  # io-site
+            ''',
+            '''
+                def read(path, open):
+                    with open(path, "rb") as stream:
+                        while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+            '''
+                def read(path):
+                    with open(path, "r+b") as stream:
+                        while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+            '''
+                from pathlib import Path
+                def read(path: Path, other):
+                    path = other
+                    with path.open("rb") as stream:
+                        while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+            '''
+                from pathlib import Path
+                from typing import Sequence
+                def read(paths: Sequence[Path], other):
+                    paths = other
+                    for path in paths:
+                        with path.open("rb") as stream:
+                            while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+            '''
+                import builtins
+                def read(path, replacement):
+                    builtins.open = replacement
+                    with open(path, "rb") as stream:
+                        while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_io(source, expected=True)
+        for size in ('1', '0', '-1', 'limit', 'True'):
+            with self.subTest(size=size):
+                self.assert_io('def read(path):\n'
+                               '    with open(path, "rb") as stream:\n'
+                               f'        while chunk := stream.read({size}): consume(chunk)  # io-site\n',
+                               expected=True)
+
+    def test_buffered_reads_do_not_hide_expensive_outer_rereads(self) -> None:
+        cases = (
+            '''
+                def read(path, attempts):
+                    for attempt in attempts:
+                        with open(path, "rb") as stream:
+                            while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+            '''
+                def read(path, attempts):
+                    while attempts:
+                        with open(path, "rb") as stream:
+                            while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+            '''
+                def read(paths, attempts):
+                    for attempt in attempts:
+                        for path in paths:
+                            with open(path, "rb") as stream:
+                                while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+            '''
+                def read(path, paths):
+                    with open(path, "rb") as stream:
+                        for path in paths:
+                            while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+            '''
+                def read(paths):
+                    for path in paths:
+                        for path in paths:
+                            with open(path, "rb") as stream:
+                                while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+            '''
+                def read(paths, fixed):
+                    for path in paths:
+                        path = fixed
+                        with open(path, "rb") as stream:
+                            while chunk := stream.read(65536): consume(chunk)  # io-site
+            ''',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_io(source, expected=True)
+        self.assert_io('''
+            def read(paths):
+                for path in paths:
+                    with open(path, "rb") as stream:
+                        while chunk := stream.read(65536): consume(chunk)  # io-site
+        ''', expected=False)
+        self.assert_io('''
+            def read(path, attempts):
+                for attempt in attempts:
+                    consume(attempt)
+                else:
+                    with open(path, "rb") as stream:
+                        while chunk := stream.read(65536): consume(chunk)  # io-site
+        ''', expected=False)
+
+    def test_parse_uncertainty_does_not_erase_candidates(self) -> None:
+        code = 'for item in items: stream.write(item)\n' * 6 + 'def broken(\n'
+        self.assertEqual(pattern_lines(self.RULE, code), [1, 2, 3, 4, 5, 6])
+
+    def test_multiline_coverage_is_unchanged_by_the_precision_filter(self) -> None:
+        # Extending the legacy same-line rule is a separate coverage/policy
+        # change; this fix must not silently alter its global warning budget.
+        code = 'for item in items:\n    stream.write(item)\n' * 6
+        self.assertEqual(pattern_lines(self.RULE, code), [])
+
+    def test_project_threshold_and_rule_scoped_suppression_stay_intact(self) -> None:
+        line = 'for item in items: stream.write(item)\n'
+        self.assertEqual(pattern_lines(self.RULE, line * 5), [])
+        self.assertEqual(pattern_lines(self.RULE, line * 6), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(pattern_lines(self.RULE, line * 6
+                         + 'for item in items: stream.write(item)  # ubs:ignore[py.perf.io-in-loop]\n'),
+                         [1, 2, 3, 4, 5, 6])
+        self.assertEqual(pattern_lines(self.RULE, line * 5
+                         + 'for item in items: stream.write(item)  # ubs:ignore[py.debug.print]\n'),
+                         [1, 2, 3, 4, 5, 6])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

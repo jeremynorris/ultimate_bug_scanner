@@ -37,7 +37,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from ubs_core.io import read_ndjson
 from ubs_core.lexer import strip_comments_and_strings
@@ -155,6 +155,12 @@ class Pattern:
     ``code_only`` — require Python source and blank both comments and strings.
     Operator evidence must come from executable source, while marker rules
     keep their existing comment-aware view.
+
+    ``line_filter`` — optionally narrow regex candidates to source lines with
+    structural evidence. It sees the original source so literals retain their
+    syntax; returning None keeps the conservative regex candidates when the
+    source cannot be parsed. Thresholds, caches and suppressions still operate
+    on the same source-local matches.
     """
 
     category: int
@@ -169,6 +175,7 @@ class Pattern:
     scan_strings: bool = False  # match inside string literals too
     exclude_file_regex: re.Pattern[str] | None = None  # skip files whose text matches
     code_only: bool = False
+    line_filter: Callable[[str], set[int] | None] | None = None
 
 
 def _notebook_code_view(text: str, document: dict) -> str:
@@ -254,8 +261,17 @@ def iter_matches(
     preserves offsets, so both share one coordinate system.
     """
     source = raw_text if raw_text is not None else text
+    eligible = None
+    filtered = pattern.line_filter is None
     for match in pattern.regex.finditer(text):
+        if not filtered:
+            # Structural refinement is unnecessary when the cheap candidate
+            # pattern found nothing in this source.
+            eligible = pattern.line_filter(source)
+            filtered = True
         line_no = text.count("\n", 0, match.start()) + 1
+        if eligible is not None and line_no not in eligible:
+            continue
         line_start = source.rfind("\n", 0, match.start()) + 1
         line_end = source.find("\n", match.start())
         if line_end == -1:
@@ -599,7 +615,7 @@ def _source_versions(files: Sequence[Path], problems: list[str]) -> dict[Path, t
             identity = str(path.resolve(strict=True))
             digest = hashlib.blake2b(digest_size=16)
             with path.open("rb") as source:
-                # bounded 128 KiB reads feeding the digest; reading in chunks is the point of this loop — ubs:ignore[py.perf.io-in-loop]
+                # Hash incrementally without allocating a whole source file.
                 while chunk := source.read(128 * 1024):
                     digest.update(chunk)
             versions[path] = (identity, digest.hexdigest())

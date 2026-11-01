@@ -43,9 +43,315 @@ Equivalence notes:
 """
 from __future__ import annotations
 
+import ast
 import re
 
 from ubs_core.py_scan import Pattern
+
+
+def _repeated_io_lines(source: str) -> set[int] | None:
+    """Refine the legacy same-line candidates without widening that policy.
+
+    A loop word in prose, an identifier or a call's generator argument does
+    not repeat the call. Multiline loop coverage remains a separate policy
+    change: this filter only removes disproven legacy regex candidates.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        # Native Python syntax failures are reported by the completion gate;
+        # retain conservative regex evidence for notebooks/Cython here.
+        return None
+    nodes = tuple(ast.walk(tree))
+    parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+    scope_kinds = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)
+
+    def scope_of(node):
+        parent = parents.get(node)
+        while parent is not None and not isinstance(parent, scope_kinds):
+            parent = parents.get(parent)
+        return parent
+
+    bound = {node.id for node in nodes
+             if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))}
+    bound.update(node.arg for node in nodes if isinstance(node, ast.arg))
+    bound.update(node.name for node in nodes
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+    path_types = set()
+    path_modules = set()
+    for node in nodes:
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if node.module == 'pathlib' and not node.level and alias.name == 'Path':
+                    path_types.add(local)
+                else:
+                    bound.add(local)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split('.')[0]
+                if alias.name == 'pathlib':
+                    path_modules.add(local)
+                else:
+                    bound.add(local)
+    path_types -= bound
+    path_modules -= bound
+    dynamic_bindings = any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id in {'exec', 'eval', 'globals', 'locals', 'vars', 'setattr'}
+        or isinstance(node, ast.ImportFrom) and any(alias.name == '*' for alias in node.names)
+        or isinstance(node, ast.Name) and node.id == '__builtins__'
+        or isinstance(node, ast.Attribute) and (
+            node.attr in {'__dict__', '__globals__', 'f_globals', 'f_locals', 'f_builtins'}
+            or node.attr in {'open', 'Path'} and isinstance(node.ctx, (ast.Store, ast.Del)))
+        for node in nodes)
+
+    def is_path_type(node):
+        return (isinstance(node, ast.Name) and node.id in path_types
+                or isinstance(node, ast.Attribute) and node.attr == 'Path'
+                and isinstance(node.value, ast.Name) and node.value.id in path_modules)
+
+    def typed_path(node, scope):
+        if isinstance(node, ast.Call):
+            return is_path_type(node.func)
+        if not isinstance(node, ast.Name) or not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        arguments = {arg.arg: arg.annotation for arg in (
+            *scope.args.posonlyargs, *scope.args.args, *scope.args.kwonlyargs)}
+        writes = [item for item in nodes if isinstance(item, ast.Name)
+                  and item.id == node.id and isinstance(item.ctx, (ast.Store, ast.Del))
+                  and scope_of(item) is scope]
+        if not writes:
+            return is_path_type(arguments.get(node.id))
+        # An element of a typed Path sequence is enough for the scanner's
+        # normal `for path in files` read loop, but a later reassignment is not.
+        if len(writes) != 1:
+            return False
+        loop = parents.get(writes[0])
+        if not (isinstance(loop, (ast.For, ast.AsyncFor)) and loop.target is writes[0]
+                and isinstance(loop.iter, ast.Name)):
+            return False
+        if any(isinstance(item, ast.Name) and item.id == loop.iter.id
+               and isinstance(item.ctx, (ast.Store, ast.Del)) and scope_of(item) is scope
+               for item in nodes):
+            return False
+        annotation = arguments.get(loop.iter.id)
+        return (isinstance(annotation, ast.Subscript)
+                and isinstance(annotation.value, ast.Name)
+                and annotation.value.id in {'Sequence', 'Iterable', 'Iterator', 'list', 'tuple', 'set'}
+                and is_path_type(annotation.slice))
+
+    def read_only_opener(call, scope):
+        if not isinstance(call, ast.Call) or dynamic_bindings:
+            return False
+        if isinstance(call.func, ast.Name) and call.func.id == 'open' and 'open' not in bound:
+            mode_index = 1
+        elif (isinstance(call.func, ast.Attribute) and call.func.attr == 'open'
+              and typed_path(call.func.value, scope)):
+            mode_index = 0
+        else:
+            return False
+        if any(isinstance(arg, ast.Starred) for arg in call.args):
+            return False
+        if any(keyword.arg in {None, 'opener'} for keyword in call.keywords):
+            return False
+        mode = call.args[mode_index] if len(call.args) > mode_index else ast.Constant(value='r')
+        for keyword in call.keywords:
+            if keyword.arg == 'mode':
+                mode = keyword.value
+        return isinstance(mode, ast.Constant) and mode.value in {'r', 'rb', 'rt'}
+
+    def positive_size(node):
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            left, right = positive_size(node.left), positive_size(node.right)
+            if left > 0 and right > 0:
+                return min(left * right, 1 << 30)
+        return 0
+
+    def enclosing_loops(node):
+        child = node
+        parent = parents.get(child)
+        while parent is not None and not isinstance(parent, scope_kinds):
+            if isinstance(parent, (ast.For, ast.AsyncFor, ast.While)) and child in parent.body:
+                yield parent
+            child, parent = parent, parents.get(parent)
+
+    def distinct_stream_each_iteration(loop, context, opener):
+        # Chunking a file does not make reopening that same file for every
+        # attempt cheap. Each enclosing loop must select the opened path;
+        # a loop inside an already-open context cannot establish that fact.
+        outer_contexts = set(enclosing_loops(context))
+        if isinstance(opener.func, ast.Attribute):
+            source = opener.func.value
+        else:
+            source = opener.args[0] if opener.args else next(
+                (keyword.value for keyword in opener.keywords if keyword.arg == 'file'), None)
+        if isinstance(source, ast.Call) and is_path_type(source.func) and len(source.args) == 1:
+            source = source.args[0]
+        while isinstance(source, ast.Attribute):
+            source = source.value
+        source_name = source.id if isinstance(source, ast.Name) else None
+        outer_loops = tuple(enclosing_loops(loop))
+        # A single path binding cannot establish independent progress through
+        # two loops, including two nested loops that reuse the same name.
+        if len(outer_loops) > 1:
+            return False
+        for outer in outer_loops:
+            if not isinstance(outer, (ast.For, ast.AsyncFor)) or outer not in outer_contexts:
+                return False
+            targets = set(ast.walk(outer.target))
+            selected = {target.id for target in targets
+                        if isinstance(target, ast.Name) and isinstance(target.ctx, ast.Store)}
+            if source_name not in selected:
+                return False
+            for node in ast.walk(outer):
+                if node in targets or not isinstance(getattr(node, 'ctx', None), (ast.Store, ast.Del)):
+                    continue
+                target = node
+                while isinstance(target, (ast.Attribute, ast.Subscript)):
+                    target = target.value
+                if isinstance(target, ast.Name) and target.id == source_name:
+                    return False
+        return True
+
+    def draining_read(loop):
+        # Exempt a buffered, EOF-controlled drain of one stable opened reader.
+        # A byte-at-a-time read, unknown size, cursor reset, alias escape or
+        # reassignment is still a candidate; a literal size alone proves none
+        # of those properties.
+        test = loop.test
+        if not (isinstance(test, ast.NamedExpr) and isinstance(test.target, ast.Name)
+                and isinstance(test.value, ast.Call)):
+            return None
+        call = test.value
+        if not (isinstance(call.func, ast.Attribute) and call.func.attr == 'read'
+                and isinstance(call.func.value, ast.Name) and len(call.args) == 1
+                and not call.keywords and positive_size(call.args[0]) >= 8192):
+            return None
+        name = call.func.value.id
+        context = parents.get(loop)
+        while context is not None and not isinstance(context, scope_kinds):
+            if isinstance(context, ast.With):
+                item = next((item for item in context.items
+                             if isinstance(item.optional_vars, ast.Name)
+                             and item.optional_vars.id == name), None)
+                if item is not None:
+                    break
+            context = parents.get(context)
+        else:
+            return None
+        if not read_only_opener(item.context_expr, scope_of(context)):
+            return None
+        if not distinct_stream_each_iteration(loop, context, item.context_expr):
+            return None
+        loop_nodes = set(ast.walk(loop))
+        for node in ast.walk(context):
+            if not isinstance(node, ast.Name) or node.id != name or node is item.optional_vars:
+                continue
+            if not isinstance(node.ctx, ast.Load) or scope_of(node) is not scope_of(context):
+                return None
+            member = parents.get(node)
+            invocation = parents.get(member)
+            if not (isinstance(member, ast.Attribute) and member.value is node
+                    and isinstance(invocation, ast.Call) and invocation.func is member):
+                return None
+            if node in loop_nodes and invocation is not call:
+                return None
+            if member.attr not in {'read', 'seek', 'tell', 'fileno', 'close'}:
+                return None
+        return call
+
+    class RepeatedIO(ast.NodeVisitor):
+        def __init__(self):
+            self.depth = 0
+            self.callback_depth = 0
+            self.stream_reads = set()
+            self.lines = set()
+
+        def visit_Call(self, node):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, 'attr', '')
+            root = func
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if (self.depth and node not in self.stream_reads
+                    and (name in {'open', 'read', 'write'}
+                         or isinstance(root, ast.Name) and root.id == 'requests')):
+                self.lines.add(node.lineno)
+            self.generic_visit(node)
+
+        def visit_For(self, node):
+            # Iterables are evaluated once; callbacks passed to an unknown
+            # iterable factory can still run repeatedly, so keep their reads.
+            self.callback_depth += 1
+            self.visit(node.iter)
+            self.callback_depth -= 1
+            self.depth += 1
+            self.visit(node.target)
+            for statement in node.body:
+                self.visit(statement)
+            self.depth -= 1
+            for statement in node.orelse:
+                self.visit(statement)
+
+        visit_AsyncFor = visit_For
+
+        def visit_While(self, node):
+            read = draining_read(node)
+            if read is not None:
+                self.stream_reads.add(read)
+            self.depth += 1
+            self.visit(node.test)
+            for statement in node.body:
+                self.visit(statement)
+            self.depth -= 1
+            for statement in node.orelse:
+                self.visit(statement)
+
+        def visit_FunctionDef(self, node):
+            for expression in (*node.decorator_list, *node.args.defaults, *node.args.kw_defaults):
+                if expression is not None:
+                    self.visit(expression)
+            depth, self.depth = self.depth, 0
+            callbacks, self.callback_depth = self.callback_depth, 0
+            for statement in node.body:
+                self.visit(statement)
+            self.depth, self.callback_depth = depth, callbacks
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, node):
+            depth = self.depth
+            self.depth = max(self.depth, self.callback_depth)
+            self.generic_visit(node)
+            self.depth = depth
+
+        def visit_ListComp(self, node):
+            depth = self.depth
+            for generator in node.generators:
+                self.callback_depth += 1
+                self.visit(generator.iter)
+                self.callback_depth -= 1
+                self.depth += 1
+                self.visit(generator.target)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            if isinstance(node, ast.DictComp):
+                self.visit(node.key)
+                self.visit(node.value)
+            else:
+                self.visit(node.elt)
+            self.depth = depth
+
+        visit_SetComp = visit_ListComp
+        visit_DictComp = visit_ListComp
+        visit_GeneratorExp = visit_ListComp
+
+    visitor = RepeatedIO()
+    visitor.visit(tree)
+    return visitor.lines
 
 # One parameter: optional separator (`*,` / `/,`) first, then a name with
 # its annotation and default. One level of brackets/parens is allowed so the
@@ -129,12 +435,15 @@ PATTERNS: list[Pattern] = [
         category=12,
         rule_id="py.perf.io-in-loop",
         title="I/O in loops",
-        # Legacy stage 1 is a bare substring `for|while`; keep the looseness.
+        # Retain the legacy same-line candidates and project-wide threshold;
+        # the structural filter verifies that a real call repeats.
         regex=re.compile(
             r"^(?=.*(?:for|while))(?=.*(?:open\(|read\(|write\(|requests\.))",
             re.MULTILINE,
         ),
         thresholds=((5, "warning"),),
+        code_only=True,
+        line_filter=_repeated_io_lines,
     ),
     # ── Category 14: CODE QUALITY MARKERS ───────────────────────────────────
     Pattern(

@@ -512,7 +512,6 @@ def run_prefilter(
         with temporary_file(mode="w", encoding="utf-8", prefix="ubs_prefilter_lits_", named=True) as tf:
             if any(not lit or any(c in lit for c in "\r\n\0") for lit in index.all_literals):
                 return bypass("literal cannot be represented in a line-oriented search")
-            # one write of the joined literal list; the for is the join's generator, not repeated I/O — ubs:ignore[py.perf.io-in-loop]
             tf.write("\n".join(re.escape(lit) for lit in index.all_literals) + "\n")
             # Native scanners differ in Unicode folding and invalid UTF-8 repair
             # (ignore vs replace). Any non-ASCII byte therefore admits ALL checks

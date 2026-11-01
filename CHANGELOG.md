@@ -10,7 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixed
+
+- Python's I/O-in-loop rule checks that a candidate call actually repeats.
+  Comments, loop-like identifier text, one write around a generator argument,
+  and proven buffered EOF drains no longer produce performance warnings.
+  Repeated I/O, uncertain stream ownership and cursor resets remain candidates;
+  the existing project-wide threshold and suppression rules are unchanged.
 
 ---
 
