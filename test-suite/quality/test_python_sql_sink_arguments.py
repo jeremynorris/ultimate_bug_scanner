@@ -59,6 +59,10 @@ CASES = (
     ("fragment-warning", 'from settings import TABLE_VALUE\nqs.extra(where=[f"name = {TABLE_VALUE}"])\n', ((WARNING, 2),)),
     ("fragment-critical-wins", 'def run(qs, user):\n    qs.extra(select={"flag": f"id = {UNKNOWN}"}, where=[f"name = {user}"])\n', ((CRITICAL, 2),)),
     ("ordinary-positional", 'def run(cursor, user):\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 2),)),
+    ("fromkeys-mixed-primitives", 'def run(cursor, user):\n    keys = dict.fromkeys(key for key in ("entry", 1, None))\n    cursor.execute("SELECT ?", (user,))\n', ()),
+    ("fromkeys-tuple-default", 'def run(cursor, user):\n    queries = dict.fromkeys(((name, index) for name, index in [("users", 1)]), f"SELECT {user}")\n    cursor.execute(queries[("users", 1)])\n', ((CRITICAL, 3),)),
+    ("fromkeys-tuple-bound", 'def run(cursor, user):\n    queries = dict.fromkeys(((name, index) for name, index in [("users", 1)]), "SELECT ?")\n    cursor.execute(queries[("users", 1)], (user,))\n', ()),
+    ("fromkeys-nested-tuple", 'def run(cursor, user):\n    keys = dict.fromkeys(key for key in ((("users", 1), None),))\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 3),)),
     ("keyword-alias", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    cursor.execute(query=query)\n', ((CRITICAL, 3),)),
     ("multiline", 'def run(cursor, user):\n    cursor.execute(\n        query=f"SELECT {user}"\n    )\n', ((CRITICAL, 2),)),
     ("bound-query", 'def run(cursor, user):\n    cursor.execute(query="SELECT * FROM users WHERE name = %s", params=(user,))\n', ()),
@@ -226,7 +230,9 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
         artifacts.mkdir(parents=True, exist_ok=True)
         run = Path(tempfile.mkdtemp(prefix='python-sql-flow-cli-', dir=artifacts))
         selected = {'loop-carried-query', 'loop-bound-values-stay-data',
-                    'exception-before-literal-overwrite', 'finally-cleans-break-exit'}
+                    'exception-before-literal-overwrite', 'finally-cleans-break-exit',
+                    'fromkeys-mixed-primitives', 'fromkeys-tuple-default',
+                    'fromkeys-tuple-bound', 'fromkeys-nested-tuple'}
         tools = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                  for name in ('ubs', 'modules/ubs-python.sh',
                               'modules/helpers/ubs_core/py_detectors/sql_injection.py')}

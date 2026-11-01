@@ -930,6 +930,113 @@ class SQLValueCaptureTests(unittest.TestCase):
                 self.inspect('fromkeys-' + name,
                              program(f'    mapping = {constructor}\n    qs.extra(select=mapping)\n'), expected)
 
+    def test_fromkeys_immutable_key_shapes_preserve_sql_provenance(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        for shape, key, selected in (
+                ('pair', '(query, index)', 'list(mapping)[0][0]'),
+                ('nested', '((query, index), None)', 'list(mapping)[0][0][0]'),
+                ('mixed-leaves', '(query, index, None, ("tag", 2))', 'list(mapping)[0][0]')):
+            for label, query, rows in (('unsafe', unsafe, 2), ('static', safe, 1)):
+                source = program(f'    query = {query}\n'
+                                 f'    mapping = dict.fromkeys({key} for index in (1, 2))\n'
+                                 f'    return cursor.execute({selected}).fetchone()[0]\n')
+                name = 'fromkeys-immutable-' + shape + '-' + label
+                with self.subTest(shape=shape, value=label):
+                    self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], rows)
+                    self.inspect(name, source, ((CRITICAL, 4),) if label == 'unsafe' else ())
+
+    def test_fromkeys_mixed_key_shapes_keep_eager_and_lazy_effects(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        cases = (
+            ('write', f'    query = {safe}\n'
+             f'    mapping = dict.fromkeys(((query := {unsafe}), item)\n'
+             '                            for item in ("entry", 1, None, ("nested", 2)))\n'
+             '    return cursor.execute(query).fetchone()[0]\n', 2, ((CRITICAL, 5),)),
+            ('default-first', f'    query = {unsafe}\n'
+             '    mapping = dict.fromkeys(((query, item) for item in (1, None)),\n'
+             f'                            (query := {safe}))\n'
+             '    return cursor.execute(list(mapping)[0][0]).fetchone()[0]\n', 1, ()),
+            ('exhausted-alias', f'    query = {safe}\n'
+             f'    pending = (((query := {unsafe}), item) for item in (1, None))\n'
+             '    alias = pending\n    dict.fromkeys(pending)\n'
+             f'    query = {safe}\n    dict.fromkeys(alias)\n'
+             '    return cursor.execute(query).fetchone()[0]\n', 1, ()),
+        )
+        for name, body, rows, expected in cases:
+            source = program(body)
+            with self.subTest(effect=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'fromkeys-immutable-' + name, source)['rows'], rows)
+                self.inspect('fromkeys-immutable-' + name, source, expected)
+        for label, keys in (
+                ('mixed-scalars', '("entry", 1, None)'),
+                ('mixed-tuples', '(("entry", 1), "other", None)'),
+                ('tuple-alias', 'keys')):
+            setup = '    keys = (("entry", 1), None, "other")\n' if keys == 'keys' else ''
+            source = program(setup + f'    mapping = dict.fromkeys(key for key in {keys})\n'
+                             '    cursor.execute("SELECT ?", (user,))\n')
+            self.inspect('fromkeys-immutable-' + label, source, ())
+        for label, items, emitted in (
+                ('owned-strings', '["entry", "other"]', 'item'),
+                ('owned-tuples', '[("entry", 1), ("other", 2)]', 'item'),
+                ('owned-mixed', '["entry", 1, None]', '(item,)')):
+            source = program(f'    keys = {items}\n'
+                             f'    mapping = dict.fromkeys({emitted} for item in keys)\n'
+                             '    cursor.execute("SELECT ?", (user,))\n')
+            self.inspect('fromkeys-immutable-' + label, source, ())
+
+    def test_fromkeys_immutable_containers_do_not_certify_callback_elements(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        for base, create in (('str', 'Key("entry")'), ('int', 'Key(1)'), ('tuple', 'Key(("entry",))')):
+            source = program(f'    query = {safe}\n'
+                             f'    class Key({base}):\n'
+                             '        def __hash__(self):\n            nonlocal query\n'
+                             f'            query = {unsafe}\n            return 0\n'
+                             f'    dict.fromkeys((item,) for item in ({create},))\n'
+                             '    return cursor.execute(query).fetchone()[0]\n')
+            name = 'fromkeys-immutable-subclass-' + base
+            with self.subTest(subclass=base):
+                self.assertEqual(sqlite_witness(self.artifacts, name, source)['rows'], 2)
+                path = self.artifacts / (name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'fromkeys key callbacks.*incomplete'):
+                    list(detector.find([path]))
+        source = ('def run(cursor, user: str):\n'
+                  '    dict.fromkeys(("entry", user) for item in (1,))\n'
+                  '    cursor.execute("SELECT 1")\n')
+        path = self.artifacts / 'fromkeys-immutable-annotation.py'
+        path.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'fromkeys key callbacks.*incomplete'):
+            list(detector.find([path]))
+
+    def test_fromkeys_immutable_key_proofs_do_not_survive_list_escape(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        for name, setup, consume in (
+                ('alias', '    keys = ["entry"]\n    alias = keys\n    alias[0] = Key()\n',
+                 '    dict.fromkeys((item,) for item in keys)\n'),
+                ('deferred', '    keys = ["entry"]\n    pending = ((item,) for item in keys)\n'
+                 '    keys[0] = Key()\n', '    dict.fromkeys(pending)\n'),
+                ('default', '    keys = ["entry"]\n'
+                 '    def mutate():\n        keys[0] = Key()\n',
+                 '    dict.fromkeys(((item,) for item in keys), mutate())\n'),
+                ('helper', '    keys = ["entry"]\n'
+                 '    def mutate(values):\n        values[0] = Key()\n'
+                 '    mutate(keys)\n', '    dict.fromkeys((item,) for item in keys)\n')):
+            source = program(f'    query = {safe}\n'
+                             '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
+                             f'            query = {unsafe}\n            return 0\n'
+                             + setup + consume + '    return cursor.execute(query).fetchone()[0]\n')
+            case = 'fromkeys-immutable-escaped-' + name
+            with self.subTest(escape=name):
+                self.assertEqual(sqlite_witness(self.artifacts, case, source)['rows'], 2)
+                path = self.artifacts / (case + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaises(detector.SQLFlowLimit):
+                    list(detector.find([path]))
+
     def test_sql_keywords_in_identifiers_do_not_create_sql_templates(self):
         for name in ('call', 'select', 'update', 'drop', 'token'):
             for expression in (f'1 + {name}.end()', f'f"{{{name}}}"'):

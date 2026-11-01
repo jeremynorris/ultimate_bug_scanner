@@ -1397,6 +1397,22 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return (*facts[:5], SQLInjectionAnalyzer.generator_refs(facts), kind, element_kind)
 
     @staticmethod
+    def hash_safe_shape(shape):
+        """Exact immutable builtin keys cannot invoke user hash/equality code.
+
+        A mixed primitive/tuple join retains only this capability, never a
+        numeric or string operation contract. The same bound as tuple shape
+        inference prevents recursive wrapping from growing the proof forever.
+        """
+        for _ in range(64):
+            if shape in {'str', 'number', 'none', 'scalar', 'hashable'} or shape == ():
+                return True
+            if not (isinstance(shape, tuple) and len(shape) == 2 and shape[0] == 'tuple'):
+                return False
+            shape = shape[1]
+        return False
+
+    @staticmethod
     def join_element_shapes(*shapes):
         # () means no possible element, unlike '' (an unknown element).
         # Appending to [] and joining a zero-trip loop must not destroy a
@@ -1410,6 +1426,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if all(isinstance(shape, tuple) and len(shape) == 2 and shape[0] == 'tuple'
                for shape in present):
             return ('tuple', SQLInjectionAnalyzer.join_element_shapes(*(shape[1] for shape in present)))
+        if present <= {'str', 'number', 'none', 'scalar'}:
+            return 'scalar'
+        if all(SQLInjectionAnalyzer.hash_safe_shape(shape) for shape in present):
+            return 'hashable'
         return ''
 
     @staticmethod
@@ -1421,13 +1441,16 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 # primitives. Keep that non-aliasing fact without claiming
                 # the particular numeric/string operations of either arm.
                 return 'scalar', ''
+            if kinds and all(SQLInjectionAnalyzer.hash_safe_shape(
+                    SQLInjectionAnalyzer.element_shape(pair)) for pair in pairs):
+                return 'hashable', ''
             return '', ''
         return next(iter(kinds)), SQLInjectionAnalyzer.join_element_shapes(*(pair[1] for pair in pairs))
 
     @staticmethod
     def element_shape(pair):
         kind, element = pair
-        if kind == 'tuple' and (element == () or element in {'str', 'number'}
+        if kind == 'tuple' and (element == () or element in {'str', 'number', 'none', 'scalar', 'hashable'}
                                 or isinstance(element, tuple)):
             shape = kind, element
             current = shape
@@ -2569,8 +2592,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                             for identity in references)
             keys = self.materialize_generators(references, consumer_can_raise=True)
             # Arbitrary key hashing/equality can mutate enclosing SQL state.
-            # Exact primitive keys cannot dispatch those callbacks.
-            if not exhausted and self.fact_kinds(keys)[0] not in {'str', 'number', 'none'}:
+            # Exact primitives and tuples recursively containing only those
+            # primitives cannot dispatch those callbacks. SQL provenance is
+            # still carried by every element and by the separately saved default.
+            if not exhausted and not self.hash_safe_shape(self.element_shape(self.fact_kinds(keys))):
                 raise SQLFlowLimit('SQL dict.fromkeys key callbacks are unresolved; analysis is incomplete')
             combined = self.join_value_facts(keys, default)
             self._evaluated_values[node] = self.with_kinds(
@@ -3658,8 +3683,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if value in self._evaluated_values:
             facts = self._evaluated_values[value]
             if (isinstance(value, ast.Name) and self.fact_kinds(facts)[0] == 'list'
-                    and isinstance(self.fact_kinds(facts)[1], tuple)
-                    and self.fact_kinds(facts)[1] != () and value.id not in self.exclusive_lists):
+                    and self.fact_kinds(facts)[1] != '' and value.id not in self.exclusive_lists
+                    and self.numeric_fact_reference(facts) is None):
                 facts = self.with_kinds(facts, 'list')
             reference = self.numeric_fact_reference(facts)
             if reference is not None and (reference[0] not in self.numeric_regions
@@ -3684,7 +3709,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     return 'list', ('' if self.record_fields(reference) else 'number') if reference[1] == 1 else 'list'
                 return 'list', ''
             pair = self.value_kinds.get(value.id, ('', ''))
-            if (pair[0] == 'list' and isinstance(pair[1], tuple) and pair[1] != ()
+            if (pair[0] == 'list' and pair[1] != ''
                     and value.id not in self.exclusive_lists):
                 return 'list', ''
             return pair
@@ -3765,12 +3790,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             index = self.with_kinds((None, None, None, False, 'static'), 'number')
             pair = self.with_kinds(self.join_value_facts(index, item), 'tuple')
             return (*pair, (index, item))
-        if (self.fact_kinds(facts)[0] == 'list' and isinstance(self.fact_kinds(facts)[1], tuple)
-                and self.fact_kinds(facts)[1] != ()
+        if (numeric is None and self.fact_kinds(facts)[0] == 'list' and self.fact_kinds(facts)[1] != ''
                 and not (isinstance(value, ast.Name) and value.id in self.exclusive_lists
                          or isinstance(value, ast.List))):
-            # The tuple itself is immutable, but an escaped outer list could
-            # now contain arbitrary replacements. Do not project stale types.
+            # Immutable initial elements do not freeze a mutable outer list.
+            # Escaped storage may now hold callbacks, even if it held only
+            # strings, numbers or tuples before. Do not project stale types.
             facts = self.with_kinds(facts, 'list')
         return self.element_facts(facts)
 
@@ -4120,7 +4145,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                                               'any', 'all', 'iter', 'str', 'repr', 'bool', 'id', 'type'})
         if not known_builtin:
             self.note_possible_raise()
-        borrowed = self.immediate_generator_borrow(node) if known_builtin else set()
+        borrowed = self.immediate_generator_borrow(node)
         enclosing_iterations = self._iterated_lists
         # The sink's own first line is what a guard has to precede (GH #133).
         # Using the sink line rather than the interpolated value's line keeps
@@ -4497,7 +4522,20 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def immediate_generator_borrow(self, call):
         """Borrow a private list during an unaliased builtin consumer."""
         predicates = {'any', 'all'}
-        if (call.func.id not in predicates | {'sum', 'list', 'tuple', 'set', 'frozenset', 'sorted', 'min', 'max'}
+        consumers = predicates | {'sum', 'list', 'tuple', 'set', 'frozenset', 'sorted', 'min', 'max'}
+        consumer = None
+        if (isinstance(call.func, ast.Name) and call.func.id in consumers
+                and self.builtin_is_unshadowed(call.func.id)):
+            consumer = call.func.id
+        elif (isinstance(call.func, ast.Attribute) and call.func.attr == 'fromkeys'
+                and isinstance(call.func.value, ast.Name) and call.func.value.id == 'dict'
+                and self.builtin_is_unshadowed('dict')):
+            bindings = self.ownership_bindings()
+            if not bindings.dynamic_namespace and not bindings.builtin_namespace:
+                consumer = 'fromkeys'
+        # A second argument can mutate/escape the list after generator creation.
+        # Keep the existing one-argument lifetime proof for the new consumer.
+        if (consumer not in consumers | {'fromkeys'}
                 or len(call.args) != 1 or call.keywords
                 or not isinstance(call.args[0], ast.GeneratorExp)):
             return set()
@@ -4512,7 +4550,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self.step()
             if (node is not generator and isinstance(node, (ast.NamedExpr, ast.Lambda,
                     ast.GeneratorExp, ast.Await, ast.Yield, ast.YieldFrom))
-                    or isinstance(node, ast.Call) and call.func.id in predicates
+                    or isinstance(node, ast.Call) and consumer in predicates
                     or isinstance(node, ast.Name) and node.id == root.id and node is not root):
                 return set()
         return {root.id}

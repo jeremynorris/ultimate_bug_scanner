@@ -31,6 +31,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   values. Identifiers such as `call`, `select` and `update` no longer create
   SQL templates; interpolated SQL still produces the existing findings.
 
+- Python SQL flow accepts generator-based `dict.fromkeys` with proven
+  immutable primitive and tuple keys, including mixed and nested keys.
+  Generator effects and the separately evaluated default retain their SQL
+  provenance. Escaped lists lose stale element proofs; an immediate
+  one-argument consumer can borrow a still-private list until exhaustion.
+  Unknown hash/equality callbacks and unproved record keys remain incomplete.
+
 - Python's I/O-in-loop rule checks that a candidate call actually repeats.
   Comments, loop-like identifier text, one write around a generator argument,
   and proven buffered EOF drains no longer produce performance warnings.
