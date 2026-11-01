@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.5.26] - 2026-11-01 [Release]
+
 ### Known issues
 
 The first five are in v5.5.3 as well.
