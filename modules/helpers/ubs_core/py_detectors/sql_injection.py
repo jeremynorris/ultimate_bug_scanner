@@ -153,6 +153,10 @@ class SanitizerBindings:
         self._function_calls = {}
         self._escaped_classes = {}
         self._forwarding_cache = {}
+        self._closed_function_cache = {}
+        self._process_namespace_closed = None
+        self._process_forwarders = set()
+        self._instrumentation_lists = {}
         self.independent_functions = self._independent_functions()
         for scope in self.owner_scopes.values():
             scope['capture_barriers'] = frozenset(scope['capture_barriers'])
@@ -560,6 +564,259 @@ class SanitizerBindings:
             return False
         return True
 
+    def lexical_owner(self, node):
+        """The lexical cell a name denotes, including captured outer cells."""
+        if not isinstance(node, ast.Name) or node.id in self.indirect_rebindings:
+            return None
+        scope = self.scope_of.get(node)
+        while scope is not None:
+            if node.id in scope['names']:
+                return scope
+            child = scope['node']
+            scope = scope['parent']
+            if not isinstance(child, ast.ClassDef):
+                while scope and isinstance(scope['node'], ast.ClassDef):
+                    scope = scope['parent']
+        return None
+
+    def closed_local_callable(self, function, active=frozenset()):
+        """Follow direct uses and exact identity wrappers, refusing exports."""
+        if function in self._closed_function_cache:
+            return self._closed_function_cache[function]
+        if function in active or not isinstance(function, ast.FunctionDef) or function.decorator_list:
+            return False
+        active = active | {function}
+        owner = self.owner_scopes[function]['parent']
+        if owner is None or isinstance(owner['node'], ast.ClassDef):
+            return False  # a class attribute needs its owner's separate escape proof
+        pending, seen = [(owner, function.name)], set()
+        while pending:
+            scope, name = pending.pop()
+            key = scope['node'], name
+            if key in seen:
+                continue
+            seen.add(key)
+            if name in self.indirect_rebindings or len(scope['names'].get(name, ())) != 1:
+                return False
+            for reference in self.name_loads.get(name, ()):
+                self.budget[0] -= 1
+                if self.budget[0] < 0:
+                    raise SQLFlowLimit('SQL callable ownership budget exceeded; analysis is incomplete')
+                if self.lexical_owner(reference) is not scope:
+                    continue
+                value, parent = reference, self.parents.get(reference)
+                while isinstance(parent, ast.Call) and parent.func is not value:
+                    target = self.resolve(parent.func)
+                    if (parent.args != [value] or parent.keywords or not target
+                            or target[0] != 'function' or target[2]):
+                        return False
+                    wrapper = target[1]
+                    args = wrapper.args
+                    positional = args.posonlyargs + args.args
+                    body = [statement for statement in wrapper.body if not (
+                        isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+                        and isinstance(statement.value.value, str))]
+                    if (len(positional) != 1 or args.vararg or args.kwarg or args.kwonlyargs or args.defaults
+                            or len(body) != 1 or not isinstance(body[0], ast.Return)
+                            or not isinstance(body[0].value, ast.Name)
+                            or body[0].value.id != positional[0].arg
+                            or not self.closed_local_callable(wrapper, active)):
+                        return False
+                    value, parent = parent, self.parents.get(parent)
+                if isinstance(parent, ast.Call) and parent.func is value:
+                    continue
+                if (isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is value
+                        and self.parents.get(parent) is self.scope_of[parent]['node']):
+                    targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+                    if all(isinstance(target, ast.Name) for target in targets):
+                        pending.extend((self.scope_of[parent], target.id) for target in targets)
+                        continue
+                return False
+        self._closed_function_cache[function] = True
+        return True
+
+    def process_call(self, call, target):
+        """A closed stdlib process launcher does not consume Python SQL text."""
+        consumers = {'subprocess.run', 'subprocess.call', 'subprocess.check_call', 'subprocess.check_output'}
+        if (not target or target[0] != 'import' or target[1] not in consumers
+                or len(call.args) != 1 or isinstance(call.args[0], ast.Starred)
+                or any(keyword.arg in {None, 'preexec_fn'} for keyword in call.keywords)):
+            return False
+        for keyword in call.keywords:
+            if keyword.arg in {'stdin', 'stdout', 'stderr'} and not (
+                    isinstance(keyword.value, ast.Constant)
+                    and type(keyword.value.value) in {int, type(None)}):
+                return False  # file objects can execute arbitrary code through fileno()
+        if self._process_namespace_closed is None:
+            closed = (not self.dynamic_namespace and not self.builtin_namespace
+                      and not self.regex_namespace_escape and not self.reflective_member_writes
+                      and not {'__code__', '__globals__'} & self.member_writes)
+            imports = {name for scope in self.owner_scopes.values() for name, values in scope['names'].items()
+                       for value in values if value and value[0] == 'import'
+                       and (value[1] == 'subprocess' or value[1].startswith('subprocess.'))}
+            for name in imports:
+                for reference in self.name_loads.get(name, ()):
+                    self.budget[0] -= 1
+                    if self.budget[0] < 0:
+                        raise SQLFlowLimit('SQL process binding budget exceeded; analysis is incomplete')
+                    resolved = self.resolve(reference)
+                    if not resolved or resolved[0] != 'import' or not (
+                            resolved[1] == 'subprocess' or resolved[1].startswith('subprocess.')):
+                        continue
+                    value, parent = reference, self.parents.get(reference)
+                    while isinstance(parent, ast.Attribute) and parent.value is value:
+                        if not isinstance(parent.ctx, ast.Load) or parent.attr.startswith('_'):
+                            closed = False
+                        value, parent = parent, self.parents.get(parent)
+                    selected = self.resolve(value)
+                    if (value not in self.direct_callees or not selected or selected[0] != 'import'
+                            or selected[1] not in consumers):
+                        closed = False
+            self._process_namespace_closed = closed
+        return self._process_namespace_closed
+
+    def primitive_process_argument(self, value, seen=frozenset(), *, immutable=False):
+        """Reject path/file protocol objects at a process wrapper's call site."""
+        self.budget[0] -= 1
+        if self.budget[0] < 0:
+            raise SQLFlowLimit('SQL process argument budget exceeded; analysis is incomplete')
+        if value in seen:
+            return False
+        seen = seen | {value}
+        if isinstance(value, ast.Constant):
+            return type(value.value) in {str, bytes, int, float, bool, type(None)}
+        if isinstance(value, (ast.Tuple, ast.List)):
+            if immutable and isinstance(value, ast.List):
+                return False
+            return all(self.primitive_process_argument(item, seen, immutable=True) for item in value.elts)
+        if isinstance(value, ast.Starred):
+            return self.primitive_process_argument(value.value, seen)
+        if isinstance(value, ast.JoinedStr):
+            return (len(value.values) != 1 or isinstance(value.values[0], ast.Constant)
+                    or isinstance(value.values[0], ast.FormattedValue)
+                    and self.primitive_process_argument(value.values[0].value, seen))
+        if not isinstance(value, ast.Name):
+            return False
+        scope = self.lexical_owner(value)
+        if scope is None or len(scope['names'].get(value.id, ())) != 1:
+            return False
+        assignment = self.literal_assignments.get((scope['node'], value.id))
+        if assignment is not None:
+            if assignment.lineno >= value.lineno:
+                return False
+            if isinstance(assignment.value, ast.List):
+                if immutable:
+                    return False  # iteration can export and mutate a mutable child
+                targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+                if len(targets) != 1:
+                    return False
+            for reference in self.name_loads.get(value.id, ()):
+                if self.lexical_owner(reference) is not scope:
+                    continue
+                enclosing = self.scope_of[reference]
+                while enclosing is not scope:
+                    if isinstance(enclosing['node'], (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        if not self.closed_local_callable(enclosing['node']):
+                            return False
+                    enclosing = enclosing['parent']
+                if isinstance(assignment.value, ast.List):
+                    parent = self.parents.get(reference)
+                    if (isinstance(parent, (ast.comprehension, ast.For)) and parent.iter is reference):
+                        continue
+                    if (isinstance(parent, ast.Compare) and len(parent.ops) == 1
+                            and isinstance(parent.ops[0], (ast.In, ast.NotIn))
+                            and parent.comparators == [reference]):
+                        continue
+                    return False
+            return self.primitive_process_argument(assignment.value, seen, immutable=immutable)
+        if isinstance(scope['node'], (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            for generator in scope['node'].generators:
+                if value.id in binding_target_names(generator.target) and not generator.is_async:
+                    return self.primitive_process_argument(generator.iter, seen)
+        return False
+
+    def cleared_list_iteration(self, reference, scope):
+        """A direct builtin predicate sees the list just unconditionally cleared."""
+        loop = self.parents.get(reference)
+        generator = self.parents.get(loop)
+        consumer = self.parents.get(generator)
+        if (not isinstance(loop, ast.comprehension) or loop.iter is not reference
+                or not isinstance(generator, ast.GeneratorExp) or generator.generators != [loop]
+                or loop.is_async or loop.ifs or not isinstance(consumer, ast.Call)
+                or consumer.args != [generator] or consumer.keywords
+                or self.resolve(consumer.func) not in {('unbound', 'any'), ('unbound', 'all')}):
+            return False
+        statement = consumer
+        while statement in self.parents and self.parents[statement] is not scope['node']:
+            statement = self.parents[statement]
+        body = scope['node'].body
+        if statement not in body or body.index(statement) == 0:
+            return False
+        previous = body[body.index(statement) - 1]
+        call = previous.value if isinstance(previous, ast.Expr) else None
+        if (not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute)
+                or call.func.attr != 'clear' or call.args or call.keywords
+                or not isinstance(call.func.value, ast.Name) or call.func.value.id != reference.id
+                or self.lexical_owner(call.func.value) is not scope):
+            return False
+        return not any(isinstance(node, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom))
+                       and node is not consumer for node in ast.walk(statement))
+
+    def instrumentation_append(self, call):
+        """Recognize a closed builtin list used only to append, clear and count.
+
+        The retained arguments cannot flow to an opaque reader. The sole
+        contents-read extension is a predicate over a freshly cleared list;
+        no callback in its generator body can actually run on that path.
+        """
+        if (not isinstance(call.func, ast.Attribute) or call.func.attr != 'append'
+                or not isinstance(call.func.value, ast.Name) or len(call.args) != 1 or call.keywords
+                or isinstance(call.args[0], ast.Starred)):
+            return False
+        reference = call.func.value
+        scope = self.lexical_owner(reference)
+        if scope is None:
+            return False
+        key = scope['node'], reference.id
+        if key in self._instrumentation_lists:
+            return self._instrumentation_lists[key]
+        assignment = self.literal_assignments.get(key)
+        if (len(scope['names'].get(reference.id, ())) != 1 or assignment is None
+                or not isinstance(assignment.value, ast.List) or assignment.value.elts
+                or assignment.lineno >= call.lineno):
+            return False
+        targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name) or targets[0].id != reference.id:
+            return False
+        for value in self.name_loads.get(reference.id, ()):
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL instrumentation ownership budget exceeded; analysis is incomplete')
+            if self.lexical_owner(value) is not scope:
+                continue
+            enclosing = self.scope_of[value]
+            while enclosing is not scope:
+                if isinstance(enclosing['node'], (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    if not self.closed_local_callable(enclosing['node']):
+                        return False
+                enclosing = enclosing['parent']
+            parent = self.parents.get(value)
+            if isinstance(parent, ast.Attribute) and parent.value is value:
+                use = self.parents.get(parent)
+                if (isinstance(use, ast.Call) and use.func is parent and not use.keywords
+                        and ((parent.attr == 'append' and len(use.args) == 1
+                              and not isinstance(use.args[0], ast.Starred))
+                             or parent.attr == 'clear' and not use.args)):
+                    continue
+            if (isinstance(parent, ast.Call) and parent.args == [value] and not parent.keywords
+                    and self.resolve(parent.func) == ('unbound', 'len')):
+                continue
+            if self.cleared_list_iteration(value, scope):
+                continue
+            return False
+        self._instrumentation_lists[key] = True
+        return True
+
     def forwards_to_unknown(self, function, bound):
         """Refuse a non-SQL certificate when the SQL slot escapes to a callback.
 
@@ -571,9 +828,14 @@ class SanitizerBindings:
         if cache_key in self._forwarding_cache:
             return self._forwarding_cache[cache_key]
         parameters = _positional_parameters(function)[1 if bound else 0:]
-        if not parameters:
+        roots = set(parameters[:1])
+        if not roots and function.args.vararg:
+            roots.add(function.args.vararg.arg)
+        if function.args.kwarg:
+            roots.add(function.args.kwarg.arg)
+        if not roots:
             return True
-        pending, seen = [(function, frozenset(parameters[:1]))], set()
+        pending, seen = [(function, frozenset(roots))], set()
         while pending:
             current, names = pending.pop()
             key = current, names
@@ -672,6 +934,11 @@ class SanitizerBindings:
                 if not positional and not keywords:
                     continue
                 target = self.resolve(call.func)
+                if self.process_call(call, target):
+                    self._process_forwarders.add(function)
+                    continue
+                if self.instrumentation_append(call):
+                    continue
                 if target and target[0] == 'function':
                     if target[1].args.vararg or target[1].args.kwarg:
                         return True
@@ -716,9 +983,14 @@ class SanitizerBindings:
             if ({'__getattribute__', '__getattr__'} & owner['names'].keys()
                     or '__class__' in self.member_writes or self.class_escapes(owner['node'])):
                 return False
-        elif target[1].decorator_list:
+        elif target[1].decorator_list or not self.closed_local_callable(target[1]):
             return False
-        return target[1] not in self.local_sql_effects() and not self.forwards_to_unknown(target[1], target[2])
+        if target[1] in self.local_sql_effects() or self.forwards_to_unknown(target[1], target[2]):
+            return False
+        if target[1] in self._process_forwarders:
+            return all(self.primitive_process_argument(value) for value in
+                       [*call.args, *(keyword.value for keyword in call.keywords)])
+        return True
 
     def _scope(self, node, parent):
         scope = {'node': node, 'parent': parent, 'names': {}, 'capture_barriers': set(),

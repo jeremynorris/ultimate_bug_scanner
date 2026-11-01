@@ -1206,6 +1206,123 @@ class SQLValueCaptureTests(unittest.TestCase):
         self.inspect('local-execute-next-to-db', source
                      + 'def count(cursor, user):\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 9),))
 
+    def test_variadic_process_wrapper_matches_renamed_instrumentation(self):
+        source = ('import subprocess\n\ndef wrap(run):\n    return run\n\n'
+                  'def check(repo):\n    calls = []\n    def raw(*args):\n'
+                  '        calls.append(args)\n'
+                  '        return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)\n'
+                  '    reads = [("rev-parse", "HEAD"), ("log", "-1")]\n'
+                  '    cached = wrap(raw)\n    before = [cached(*args).stdout for args in reads]\n'
+                  '    calls.clear()\n    assert not any(args in reads for args in calls)\n'
+                  '    expected = [raw(*args) for args in reads]\n'
+                  '    assert before == [r.stdout for r in expected]\n')
+        self.inspect('raw-instrumentation-reported', source, ())
+        self.inspect('raw-instrumentation-renamed', source.replace('raw', 'invoke_process'), ())
+
+    def test_variadic_builtin_and_process_roles_require_primitive_actuals(self):
+        for label, prefix, body in (
+                ('length', '', 'len(args)'),
+                ('module-alias', 'import subprocess as processes\n', 'processes.run(["tool", *args])'),
+                ('import-alias', 'from subprocess import run as launch\n', 'launch(["tool", *args])'),
+                *[(name, 'import subprocess\n', 'subprocess.' + name + '(["tool", *args])')
+                  for name in ('run', 'check_output', 'check_call', 'call')]):
+            source = (prefix + 'def raw(*args):\n    return ' + body
+                      + '\ndef check(user):\n    return raw(f"SELECT {user}")\n')
+            with self.subTest(role=label):
+                self.inspect('raw-primitive-' + label, source, ())
+        source = ('import subprocess\ndef raw(*args):\n    return subprocess.run(["tool", *args])\n'
+                  'def check(user: str):\n    return raw(user)\n')
+        # An annotation does not establish a primitive argument. Keep the
+        # callable itself a potential sink even when this value lacks SQL text.
+        tree = detector.ast.parse(source)
+        bindings = detector.SanitizerBindings(tree, frozenset(), [100_000])
+        call = next(node for node in detector.ast.walk(tree)
+                    if isinstance(node, detector.ast.Call) and detector.call_name(node.func) == 'raw')
+        self.assertFalse(bindings.non_database_callable(call))
+
+    def test_variadic_sql_and_process_callbacks_remain_conservative(self):
+        variants = (
+            ('database', '', 'cursor.execute(*args)', '', 'f"SELECT {user}"'),
+            ('opaque', 'from backend import send\n', 'send(*args)', '', 'f"SELECT {user}"'),
+            ('preexec', 'import subprocess\nfrom backend import send\n',
+             'subprocess.run(["tool", *args], preexec_fn=lambda: send(*args))', '', 'f"SELECT {user}"'),
+            ('module-escape', 'import subprocess\nfrom backend import configure\nconfigure(subprocess)\n',
+             'subprocess.run(["tool", *args])', '', 'f"SELECT {user}"'),
+            ('callable-escape', 'import subprocess\nfrom backend import configure\nconfigure(subprocess.run)\n',
+             'subprocess.run(["tool", *args])', '', 'f"SELECT {user}"'),
+            ('module-replaced', 'import subprocess\nsubprocess.run = cursor.execute\n',
+             'subprocess.run(["tool", *args])', '', 'f"SELECT {user}"'),
+            ('relative-import', 'from .subprocess import run as launch\n',
+             'launch(["tool", *args])', '', 'f"SELECT {user}"'),
+            ('local-export', 'from backend import configure\n', 'len(args)',
+             'configure(raw)\n', 'f"SELECT {user}"'),
+            ('path-callback', 'import subprocess\nfrom backend import Argument\n',
+             'subprocess.run(["tool", *args])', '', 'Argument(f"SELECT {user}")'),
+            ('file-callback', 'import subprocess\nfrom backend import Writer\n',
+             'subprocess.run(["tool"], stdout=args[0])', '', 'Writer(f"SELECT {user}")'),
+        )
+        for name, prefix, body, effects, value in variants:
+            source = (prefix + 'def raw(*args):\n    return ' + body + '\n' + effects
+                      + 'def check(user):\n    return raw(' + value + ')\n')
+            with self.subTest(boundary=name):
+                self.inspect('raw-conservative-' + name, source, ((CRITICAL, len(source.splitlines())),))
+        source = ('import subprocess\ndef raw(*args, **options):\n'
+                  '    return subprocess.run(["tool", *args], **options)\n'
+                  'def check(user, options):\n    return raw(f"SELECT {user}", **options)\n')
+        self.inspect('raw-conservative-keywords', source, ((CRITICAL, 5),))
+
+    def test_variadic_identity_wrappers_require_closed_plain_functions(self):
+        source = ('import subprocess\nfrom backend import configure\n'
+                  'class Factory:\n    def wrap(value):\n        return value\n'
+                  'configure(Factory)\n'
+                  'def raw(*args):\n    return subprocess.run(["tool", *args])\n'
+                  'def check(user):\n    cached = Factory.wrap(raw)\n    return raw(f"SELECT {user}")\n')
+        self.inspect('raw-class-identity-export', source, ((CRITICAL, 11),))
+        source = ('import subprocess\nfrom backend import configure\n'
+                  'def wrap(value):\n    return value\n'
+                  'def raw(*args):\n    return subprocess.run(["tool", *args])\n'
+                  'cached = wrap(raw)\nconfigure(cached)\n'
+                  'def check(user):\n    return raw(f"SELECT {user}")\n')
+        self.inspect('raw-identity-result-export', source, ((CRITICAL, 10),))
+
+    def test_variadic_instrumentation_and_literal_sources_do_not_escape(self):
+        variants = (
+            ('unknown-list', 'def check(user, calls):\n', '', ''),
+            ('rebound-list', 'def check(user, replacement):\n', '    calls = []\n', '    calls = replacement\n'),
+            ('list-export', 'def check(user):\n', '    calls = []\n    configure(calls)\n', ''),
+            ('chained-list', 'def check(user):\n', '    calls = other = []\n    configure(other)\n', ''),
+            ('capturing-helper', 'def check(user):\n', '    calls = []\n'
+             '    def retain(value):\n        calls.append(value)\n    configure(retain)\n', ''),
+            ('read-contents', 'def check(user):\n', '    calls = []\n',
+             '    send(calls)\n'),
+        )
+        for name, definition, setup, effects in variants:
+            source = ('import subprocess\nfrom backend import configure, send\n' + definition + setup
+                      + '    def raw(*args):\n        calls.append(args)\n'
+                      '        return subprocess.run(["tool", *args])\n' + effects
+                      + '    return raw(f"SELECT {user}")\n')
+            path = self.artifacts / ('raw-list-boundary-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            findings, incomplete = [], False
+            try:
+                findings.extend(detector.find([path]))
+            except detector.SQLFlowLimit:
+                incomplete = True
+            with self.subTest(boundary=name):
+                self.assertTrue(incomplete or any(row[0] == CRITICAL for row in findings), source)
+        for label, container, exposure in (
+                ('list-closure', '[(f"SELECT {user}",)]',
+                 '    def read():\n        return [row for row in reads]\n    configure(read)\n'),
+                ('tuple-cell', '((f"SELECT {user}",),)',
+                 '    def read():\n        return reads\n    configure(read)\n'),
+                ('mutable-child', '[[f"SELECT {user}"]]', '')):
+            source = ('import subprocess\nfrom backend import configure, mutate\n'
+                      'def raw(*args):\n    return subprocess.run(["tool", *args])\n'
+                      'def check(user):\n    reads = ' + container + '\n' + exposure
+                      + '    return [raw(*args) for args in reads if mutate(args)]\n')
+            with self.subTest(source=label):
+                self.inspect('raw-literal-boundary-' + label, source, ((CRITICAL, len(source.splitlines())),))
+
     def test_local_sql_wrappers_retain_callsite_findings(self):
         for name, prefix, body in (
                 ('direct', '', '        return self.cursor.execute(query)\n'),

@@ -46,6 +46,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   generators require a verified eager consumer; decorated or retaining
   consumers cannot inherit that proof.
 
+- Local variadic process wrappers such as the `raw(*args)` example in GH
+  #195 no longer force partial SQL analysis merely because of their name.
+  The proof checks closed callable/import bindings, actual primitive
+  arguments, and private instrumentation storage. Opaque SQL forwarding,
+  exported closures, mutated imports, and file/path protocol callbacks keep
+  their findings or explicit incomplete-analysis result.
+
 - Python's I/O-in-loop rule checks that a candidate call actually repeats.
   Comments, loop-like identifier text, one write around a generator argument,
   and proven buffered EOF drains no longer produce performance warnings.

@@ -35,6 +35,24 @@ from ubs_core.py_detectors import sql_injection as detector
 CRITICAL = "py.security.sql-injection"
 WARNING = "py.security.sql-injection-unproven"
 
+RAW_PROCESS_WRAPPER = textwrap.dedent('''\
+    import subprocess
+    def wrap(run):
+        return run
+    def check(repo):
+        calls = []
+        def raw(*args):
+            calls.append(args)
+            return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+        reads = [("rev-parse", "HEAD"), ("log", "-1")]
+        cached = wrap(raw)
+        before = [cached(*args).stdout for args in reads]
+        calls.clear()
+        assert not any(args in reads for args in calls)
+        expected = [raw(*args) for args in reads]
+        assert before == [result.stdout for result in expected]
+''')
+
 # Each case has a unique source file. The sink starts at line 2 unless a case
 # explicitly supplies a multi-line program and its expected location.
 CASES = (
@@ -65,6 +83,8 @@ CASES = (
     ("fromkeys-nested-tuple", 'def run(cursor, user):\n    keys = dict.fromkeys(key for key in ((("users", 1), None),))\n    cursor.execute(f"SELECT {user}")\n', ((CRITICAL, 3),)),
     ("application-method-fields", 'class Runner:\n    def __init__(self):\n        self.count = 0\n    def execute(self, query):\n        self.count += 1\n        return len(query) + self.count\n    def run(self, user):\n        return self.execute(f"SELECT {user}")\n', ()),
     ("application-method-field-sql", 'from backend import run_query\nclass Runner:\n    def execute(self, query):\n        self.saved = query\n        return run_query(self.saved)\n    def run(self, user):\n        return self.execute(f"SELECT {user}")\n', ((CRITICAL, 7),)),
+    ("local-raw-process-wrapper", RAW_PROCESS_WRAPPER, ()),
+    ("local-raw-opaque-sql", 'from backend import dispatch\ndef raw(*args):\n    return dispatch(*args)\ndef run(user):\n    raw(f"SELECT {user}")\n', ((CRITICAL, 5),)),
     ("keyword-alias", 'def run(cursor, user):\n    query = f"SELECT {user}"\n    cursor.execute(query=query)\n', ((CRITICAL, 3),)),
     ("multiline", 'def run(cursor, user):\n    cursor.execute(\n        query=f"SELECT {user}"\n    )\n', ((CRITICAL, 2),)),
     ("bound-query", 'def run(cursor, user):\n    cursor.execute(query="SELECT * FROM users WHERE name = %s", params=(user,))\n', ()),
@@ -235,7 +255,8 @@ class SQLSinkArgumentsCLI(unittest.TestCase):
                     'exception-before-literal-overwrite', 'finally-cleans-break-exit',
                     'fromkeys-mixed-primitives', 'fromkeys-tuple-default',
                     'fromkeys-tuple-bound', 'fromkeys-nested-tuple',
-                    'application-method-fields', 'application-method-field-sql'}
+                    'application-method-fields', 'application-method-field-sql',
+                    'local-raw-process-wrapper', 'local-raw-opaque-sql'}
         tools = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                  for name in ('ubs', 'modules/ubs-python.sh',
                               'modules/helpers/ubs_core/py_detectors/sql_injection.py')}
