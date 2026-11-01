@@ -159,8 +159,9 @@ class Pattern:
     ``line_filter`` — optionally narrow regex candidates to source lines with
     structural evidence. It sees the original source so literals retain their
     syntax; returning None keeps the conservative regex candidates when the
-    source cannot be parsed. Thresholds, caches and suppressions still operate
-    on the same source-local matches.
+    source cannot be parsed. Only native .py/.pyi inputs use this filter;
+    other grammars retain their masked lexical candidates. Thresholds, caches
+    and suppressions still operate on the same source-local matches.
     """
 
     category: int
@@ -251,18 +252,19 @@ def _notebook_code_view(text: str, document: dict) -> str:
 
 
 def iter_matches(
-    pattern: Pattern, text: str, raw_text: str | None = None
+    pattern: Pattern, text: str, raw_text: str | None = None, *, validate_source: bool = True
 ) -> Iterable[tuple[int, str]]:
     """Yield (line_number, line_text) for matches, skipping excluded lines.
 
     ``text`` is what the regex runs against (string-blanked unless the pattern
     opted out); ``raw_text`` is the original source used for the
     exclude_regex post-filter and the reported code sample. Blanking
-    preserves offsets, so both share one coordinate system.
+    preserves offsets, so both share one coordinate system. Non-native source
+    containers pass validate_source=False: their raw text is not Python code.
     """
     source = raw_text if raw_text is not None else text
     eligible = None
-    filtered = pattern.line_filter is None
+    filtered = pattern.line_filter is None or not validate_source
     for match in pattern.regex.finditer(text):
         if not filtered:
             # Structural refinement is unnecessary when the cheap candidate
@@ -409,7 +411,8 @@ def scan_patterns(
                     and pattern.exclude_file_regex.search(scan_text)):
                 continue  # matched against the same view the rule sees
             suppression = suppressions.index(path, text)
-            for line_no, line_text in iter_matches(pattern, scan_text, text):
+            for line_no, line_text in iter_matches(
+                    pattern, scan_text, text, validate_source=path.suffix.lower() in _PY_SUFFIXES):
                 if suppression.is_suppressed(line_no, pattern.rule_id):
                     continue
                 key = (path, line_no)

@@ -414,7 +414,7 @@ def check_coverage_matrix() -> None:
     ubs_text = (ROOT / "ubs").read_text(encoding="utf-8")
     match = re.search(r"^ALL_LANGS=\(([^)]*)\)", ubs_text, re.M)
     all_langs = set(match.group(1).split()) if match else set()
-    # a dev check reading the repository's own detectors.yml; a parse error should stop it with the traceback — ubs:ignore[py.parsing.json-loads-no-try]
+    # A malformed repository detectors.yml must fail this dev check; main reports the exception and exits 1. — ubs:ignore[py.parsing.json-loads-no-try]
     reg = json.loads((ROOT / "detectors.yml").read_text(encoding="utf-8"))
     reg_langs = {entry["id"] for entry in reg.get("languages", [])}
     if reg_langs != all_langs:

@@ -806,6 +806,38 @@ class IOLoopPrecisionTests(unittest.TestCase):
                         while chunk := stream.read(65536): consume(chunk)  # io-site
         ''', expected=False)
 
+    def test_notebook_code_cells_retain_lexical_io_candidates(self) -> None:
+        # Notebook JSON can itself parse as a Python dict literal. Passing it
+        # to the native AST filter would erase real code-cell candidates.
+        repeated = 'for item in items: stream.write(item)\n'
+        source = json.dumps({"cells": [
+            {"cell_type": "markdown", "source": [repeated] * 6},
+            {"cell_type": "code", "source": [repeated] * 6},
+        ]}, indent=2)
+        ast.parse(source)
+        expected = [number for number, line in enumerate(source.splitlines(), 1)
+                    if "stream.write" in line][6:]
+        selected = next(pattern for pattern in QUALITY_PATTERNS if pattern.rule_id == self.RULE)
+        with tempfile.TemporaryDirectory(prefix="ubs_notebook_io_") as temporary:
+            target = Path(temporary) / "sample.ipynb"
+            target.write_text(source, encoding="utf-8")
+            sink = _Sink()
+            scan_patterns([selected], [target], sink, skip=set())
+        self.assertEqual(len(expected), 6)
+        self.assertEqual(sorted(record["line"] for record in sink.records), expected)
+        self.assertTrue(all(record["severity"] == "warning" for record in sink.records))
+
+    def test_cython_sources_retain_lexical_io_candidates(self) -> None:
+        source = 'cdef int counter\n' + 'for item in items: stream.write(item)\n' * 6
+        selected = next(pattern for pattern in QUALITY_PATTERNS if pattern.rule_id == self.RULE)
+        with tempfile.TemporaryDirectory(prefix="ubs_cython_io_") as temporary:
+            target = Path(temporary) / "sample.pyx"
+            target.write_text(source, encoding="utf-8")
+            sink = _Sink()
+            scan_patterns([selected], [target], sink, skip=set())
+        self.assertEqual(sorted(record["line"] for record in sink.records), list(range(2, 8)))
+        self.assertTrue(all(record["severity"] == "warning" for record in sink.records))
+
     def test_parse_uncertainty_does_not_erase_candidates(self) -> None:
         code = 'for item in items: stream.write(item)\n' * 6 + 'def broken(\n'
         self.assertEqual(pattern_lines(self.RULE, code), [1, 2, 3, 4, 5, 6])

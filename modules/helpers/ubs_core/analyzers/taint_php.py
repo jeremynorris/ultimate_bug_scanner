@@ -118,6 +118,9 @@ def joined(*values: Value) -> Value:
         literal = UNKNOWN
     refs = frozenset(ref for value in values for ref in value.refs)
     if all(value.array for value in values):
+        # GH #195: retain the eager dictionary forms in this engine until the
+        # SQL pass can prove its record-state writes do not export SQL text.
+        # Generator-key callbacks must remain unresolved in that boundary.
         keys = {key: None for value in values for key, _ in value.items}
         items = {key: joined(*(dict(value.items).get(key, value.fallback or EMPTY) for value in values)) for key in keys}
         fallback = joined(*(value.fallback or EMPTY for value in values))

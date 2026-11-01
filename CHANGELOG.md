@@ -36,11 +36,29 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   and proven buffered EOF drains no longer produce performance warnings.
   Repeated I/O, uncertain stream ownership and cursor resets remain candidates;
   the existing project-wide threshold and suppression rules are unchanged.
+  Structural filtering applies to native Python; notebook code cells and Cython
+  keep their masked lexical candidates.
 - Python's constant-time comparison analyzer resolves supported local
   structural fingerprints from their receiver and method body. The C# flow
   analyzer no longer needs a secret-comparison suppression for its state
   signature. Unknown signatures, secret-bearing records, mutable aliases
   and escaped receivers remain security findings.
+  Secret evidence also survives branch joins, loop backedges and caught
+  exceptions. Secret containers and chained comparisons retain findings;
+  stable local unkeyed digest wrappers keep public checksums quiet.
+- Python SQL analysis separates independent deferred helpers from reachable
+  SQL effects, resolves bounded ordinary attribute-name tables, and checks
+  local `execute` wrappers before treating their names as database APIs.
+  Rebinding, namespace reflection, generator-key callbacks and unresolved
+  SQL forwarding remain conservative. The Kotlin flow analyzer can use its
+  original `execute` name again. The PHP analyzer's four eager dictionary
+  comprehensions remain until record-state writes have a sufficient heap
+  proof; restoring them must not hide callback-mediated SQL execution.
+- Reassessed the 24 v5.5.26 release suppressions from GH #195: removed six
+  I/O-loop markers and one comparison marker after detector regressions
+  passed. Retained fifteen genuine high-parameter-count findings tracked by
+  bead `8tqg`, the explicit descriptor-ownership marker, and the development
+  JSON check's intentional-failure marker.
 
 ---
 

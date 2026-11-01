@@ -848,6 +848,88 @@ class StructuralFingerprints(ast.NodeVisitor):
     visit_DictComp = visit_GeneratorExp
 
 
+def local_unkeyed_digest_helpers(tree):
+    """Resolve a stable, one-argument wrapper around an unkeyed hashlib call.
+
+    This gives local checksum helpers the same input-sensitive role as the
+    direct hashlib expression. Unknown helper bodies and rebinding retain the
+    conservative fallback; a reassuring name is never the evidence.
+    """
+    nodes = list(ast.walk(tree))
+    writes = StructuralFingerprints.binding_counts(nodes)
+    parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
+    reflection = {
+        'getattr', 'setattr', 'delattr', 'vars', 'globals', 'locals', 'eval', 'exec',
+        '__dict__', '__code__', '__getattribute__', '__getattr__', '__setattr__', '__builtins__',
+        '__globals__', 'modules', 'import_module',
+        '_getframe', 'currentframe', 'f_globals', 'f_locals',
+    }
+    if any(
+        (node.id if isinstance(node, ast.Name) else
+         node.attr if isinstance(node, ast.Attribute) else
+         node.name.rsplit('.', 1)[-1] if isinstance(node, ast.alias) else '') in reflection
+        for node in nodes
+    ):
+        return {}
+    if any(isinstance(node, ast.ImportFrom) and any(alias.name == '*' for alias in node.names)
+           for node in nodes):
+        return {}  # wildcard imports can replace otherwise single-write bindings
+    modules, constructors = set(), set()
+    for statement in tree.body:
+        if isinstance(statement, ast.Import):
+            modules.update(alias.asname or alias.name for alias in statement.names
+                           if alias.name == 'hashlib' and writes.get(alias.asname or alias.name) == 1)
+        if (isinstance(statement, ast.ImportFrom) and not statement.level
+                and statement.module == 'hashlib'):
+            constructors.update(alias.asname or alias.name for alias in statement.names
+                                if alias.name in UNKEYED_HASH_CTORS
+                                and writes.get(alias.asname or alias.name) == 1)
+    # An escaped module or a rewritten member no longer has a known binding.
+    modules.difference_update(
+        node.id for node in nodes if isinstance(node, ast.Name) and node.id in modules
+        and isinstance(node.ctx, ast.Load) and not isinstance(parents.get(node), ast.Attribute)
+    )
+    modules.difference_update(
+        node.value.id for node in nodes if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name) and not isinstance(node.ctx, ast.Load)
+    )
+    result = {}
+    for function in tree.body:
+        if (not isinstance(function, ast.FunctionDef) or writes.get(function.name) != 1
+                or function.decorator_list):
+            continue
+        args = function.args
+        positional = args.posonlyargs + args.args
+        if (len(positional) != 1 or args.defaults or args.kwonlyargs or args.vararg or args.kwarg):
+            continue
+        body = [statement for statement in function.body if not (
+            isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        )]
+        if len(body) != 1 or not isinstance(body[0], ast.Return):
+            continue
+        value = body[0].value
+        if not (isinstance(value, ast.Call) and not value.args and not value.keywords
+                and isinstance(value.func, ast.Attribute) and value.func.attr in {'digest', 'hexdigest'}):
+            continue
+        constructor = value.func.value
+        if not (isinstance(constructor, ast.Call) and len(constructor.args) == 1 and not constructor.keywords
+                and isinstance(constructor.args[0], ast.Name) and constructor.args[0].id == positional[0].arg):
+            continue
+        callee = constructor.func
+        known = (isinstance(callee, ast.Name) and callee.id in constructors
+                 or isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name)
+                 and callee.value.id in modules and callee.attr in UNKEYED_HASH_CTORS)
+        if not known:
+            continue
+        if any(isinstance(node, ast.Name) and node.id == function.name and isinstance(node.ctx, ast.Load)
+               and not (isinstance(parents.get(node), ast.Call) and parents[node].func is node)
+               for node in nodes):
+            continue  # unknown code can replace an escaped helper's implementation
+        result[function.name] = positional[0].arg
+    return result
+
+
 class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
     def __init__(self, path, lines, suppressions=None):
         self.path = path
@@ -861,6 +943,9 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             else build_index('\n'.join(lines), lang='python')
         )
         self.sensitive_names = set()
+        self.unkeyed_digest_helpers = {}
+        self.sensitive_containers = set()
+        self.exception_entries = []
         # Names bound to an unkeyed hashlib object fed only non-secret data
         # (GH #102): their .digest()/.hexdigest() is a checksum, not a tag.
         self.unkeyed_hash_names = set()
@@ -905,6 +990,11 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             owner = name.rsplit('.', 1)[0] if '.' in name else ''
             if name_is_sensitive(name) or name in {'hmac.new', 'hashlib.pbkdf2_hmac'} or owner == 'hmac':
                 return True
+            if isinstance(node.func, ast.Name) and node.func.id in self.unkeyed_digest_helpers:
+                parameter = self.unkeyed_digest_helpers[node.func.id]
+                shape = (len(node.args) == 1 and not isinstance(node.args[0], ast.Starred) and not node.keywords
+                         or not node.args and len(node.keywords) == 1 and node.keywords[0].arg == parameter)
+                return self.call_input_is_sensitive(node) if shape else True
             if short in {'digest', 'hexdigest'}:
                 if isinstance(node.func, ast.Attribute):
                     return self.digest_is_sensitive(node.func.value)
@@ -914,6 +1004,21 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             return self.expr_is_sensitive(node.left) or self.expr_is_sensitive(node.right)
         if isinstance(node, ast.BoolOp):
             return any(self.expr_is_sensitive(value) for value in node.values)
+        if isinstance(node, ast.IfExp):
+            return self.expr_is_sensitive(node.body) or self.expr_is_sensitive(node.orelse)
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return any(self.expr_is_sensitive(value) for value in node.elts)
+        if isinstance(node, ast.Dict):
+            return any(self.expr_is_sensitive(value) for value in [*node.keys, *node.values] if value is not None)
+        return False
+
+    def expr_has_sensitive_container(self, node):
+        if isinstance(node, ast.Name):
+            return node.id in self.sensitive_containers
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
+            return self.expr_is_sensitive(node)
+        if isinstance(node, ast.IfExp):
+            return self.expr_has_sensitive_container(node.body) or self.expr_has_sensitive_container(node.orelse)
         return False
 
     def is_unkeyed_hash_ctor(self, call):
@@ -952,6 +1057,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
 
     def mark_assignment(self, names, value):
         value_sensitive = self.expr_is_sensitive(value)
+        container_sensitive = self.expr_has_sensitive_container(value)
         explained = not value_sensitive and value_names_non_secret_vocabulary(value)
         public_signals = self.public_signal_bindings.get(value, ())
         unkeyed_hash = (
@@ -973,13 +1079,131 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
                 self.unkeyed_hash_names.add(name)
             else:
                 self.unkeyed_hash_names.discard(name)
+            if container_sensitive:
+                self.sensitive_containers.add(name)
+            else:
+                self.sensitive_containers.discard(name)
+
+    def comparison_state(self):
+        return (set(self.sensitive_names), set(self.unkeyed_hash_names),
+                set(self.explained_names), set(self.sensitive_containers))
+
+    def record_exception_entry(self, state):
+        if self.exception_entries:
+            incoming = self.exception_entries[-1]
+            incoming[0].update(state[0])
+            incoming[1].intersection_update(state[1])
+            incoming[2].intersection_update(state[2])
+            incoming[3].update(state[3])
+
+    def visit(self, node):
+        # An exception can leave a statement before its normal assignments
+        # complete. Include nested statements, not only a try body's endpoint.
+        statement = isinstance(node, ast.stmt)
+        if statement and self.exception_entries:
+            self.record_exception_entry(self.comparison_state())
+        result = super().visit(node)
+        if statement and self.exception_entries:
+            self.record_exception_entry(self.comparison_state())
+        return result
+
+    def restore_comparison_state(self, state):
+        (self.sensitive_names, self.unkeyed_hash_names,
+         self.explained_names, self.sensitive_containers) = map(set, state)
+
+    def join_comparison_states(self, *states):
+        # Sensitive provenance may come from any path. A public explanation
+        # or unkeyed-hash role must instead hold on every incoming path.
+        self.sensitive_names = set.union(*(state[0] for state in states))
+        self.unkeyed_hash_names = set.intersection(*(state[1] for state in states))
+        self.explained_names = set.intersection(*(state[2] for state in states))
+        self.sensitive_containers = set.union(*(state[3] for state in states))
+
+    def visit_If(self, node):
+        self.visit(node.test)
+        before = self.comparison_state()
+        for statement in node.body:
+            self.visit(statement)
+        body = self.comparison_state()
+        self.restore_comparison_state(before)
+        for statement in node.orelse:
+            self.visit(statement)
+        self.join_comparison_states(body, self.comparison_state())
+
+    def visit_loop(self, node, condition):
+        self.visit(condition)
+        before = self.comparison_state()
+        head = before
+        while True:
+            self.restore_comparison_state(head)
+            if isinstance(node, ast.While):
+                self.visit(condition)
+            else:
+                # A subscript target can evaluate comparisons and calls.
+                self.visit(node.target)
+            for statement in node.body:
+                self.visit(statement)
+            # This join is monotone over the finite set of local name facts:
+            # a backedge can add sensitivity or remove a public explanation.
+            self.join_comparison_states(head, self.comparison_state())
+            updated = self.comparison_state()
+            if updated == head:
+                break
+            head = updated
+        for statement in node.orelse:
+            self.visit(statement)
+        self.join_comparison_states(before, head, self.comparison_state())
+
+    def visit_For(self, node):
+        self.visit_loop(node, node.iter)
+
+    def visit_AsyncFor(self, node):
+        self.visit_For(node)
+
+    def visit_While(self, node):
+        self.visit_loop(node, node.test)
+
+    def visit_Try(self, node):
+        before = self.comparison_state()
+        self.exception_entries.append(before)
+        for statement in node.body:
+            self.visit(statement)
+        exceptions = self.exception_entries.pop()
+        self.record_exception_entry(exceptions)
+        for statement in node.orelse:
+            self.visit(statement)
+        completed = [self.comparison_state()]
+        for handler in node.handlers:
+            self.restore_comparison_state(exceptions)
+            self.visit(handler)
+            completed.append(self.comparison_state())
+        self.join_comparison_states(*completed)
+        for statement in node.finalbody:
+            self.visit(statement)
+
+    def visit_TryStar(self, node):
+        self.visit_Try(node)
+
+    def visit_Match(self, node):
+        self.visit(node.subject)
+        before = self.comparison_state()
+        completed = [before]
+        for case in node.cases:
+            self.restore_comparison_state(before)
+            self.visit(case)
+            completed.append(self.comparison_state())
+        self.join_comparison_states(*completed)
 
     def visit_FunctionDef(self, node):
         old_sensitive = set(self.sensitive_names)
+        old_containers = set(self.sensitive_containers)
+        old_exceptions = self.exception_entries
+        self.exception_entries = []
         old_unkeyed = set(self.unkeyed_hash_names)
         old_explained = set(self.explained_names)
         old_public_signals = self.public_signal_bindings
         self.sensitive_names.clear()
+        self.sensitive_containers.clear()
         self.unkeyed_hash_names.clear()
         self.explained_names.clear()
         self.public_signal_bindings = public_signal_bindings(node)
@@ -993,6 +1217,8 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         for stmt in node.body:
             self.visit(stmt)
         self.sensitive_names = old_sensitive
+        self.sensitive_containers = old_containers
+        self.exception_entries = old_exceptions
         self.unkeyed_hash_names = old_unkeyed
         self.explained_names = old_explained
         self.public_signal_bindings = old_public_signals
@@ -1002,6 +1228,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
 
     def visit_Module(self, node):
         self.structural_values = StructuralFingerprints(node).public
+        self.unkeyed_digest_helpers = local_unkeyed_digest_helpers(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node):
@@ -1031,20 +1258,23 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Compare(self, node):
-        if any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
-            values = [node.left] + list(node.comparators)
-            # Comparing against a number, boolean, or None (e.g.
-            # `total_tokens == 0`) can never leak secret material through
-            # timing; only string/bytes comparisons are timing-sensitive (#64).
-            # A literal tuple/list/set (`sig == ("socket", "socketpair")`) is
-            # a structured key, never a secret string or bytes value; the
-            # comparison is a shape dispatch, not a credential check.
-            non_secret_literal = any(
+        values = [node.left] + list(node.comparators)
+        for left, operator, right in zip(values, node.ops, values[1:]):
+            if not isinstance(operator, (ast.Eq, ast.NotEq)):
+                continue
+            # Adjacent pairs own their evidence: a numeric neighbor must not
+            # hide a later credential comparison in the same Python chain.
+            scalar_literal = any(
                 isinstance(value, ast.Constant) and not isinstance(value.value, (str, bytes))
-                or is_constant_display(value)
-                for value in values
+                for value in (left, right)
             )
-            if not non_secret_literal and any(self.expr_is_sensitive(value) for value in values):
+            # Keep literal shape-dispatch comparisons quiet, but a tuple
+            # explicitly containing secret material still leaks by equality.
+            public_display = (
+                any(is_constant_display(value) for value in (left, right))
+                and not any(self.expr_has_sensitive_container(value) for value in (left, right))
+            )
+            if not (scalar_literal or public_display) and any(self.expr_is_sensitive(value) for value in (left, right)):
                 self.remember_issue(node.lineno)
         self.generic_visit(node)
 
@@ -1326,7 +1556,8 @@ def _selftest_signature_positive_controls() -> None:
         "    return (sig, 'v1') == (expected, 'v1')\n"
     )
     lines = [line for _path, line, _code in _scan_code(code)]
-    assert lines == [4, 6, 9], lines
+    # Wrapping a signature in a tuple still compares that secret element.
+    assert lines == [4, 6, 9, 11], lines
 
 
 SELF_TESTS: tuple[tuple[str, callable], ...] = (

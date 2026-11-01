@@ -141,11 +141,19 @@ class SanitizerBindings:
         self.calls = []
         self.name_loads = {}
         self.direct_callees = set()
+        self.literal_assignments = {}
+        self.key_callbacks = set()
         self.escaped_imports = set()
         self.dynamic_namespace = False
         self.builtin_namespace = False
         self.regex_namespace_escape = False
+        self.reflective_member_writes = False
         self._walk(tree, self._scope(tree, None))
+        self._local_sql_effects = None
+        self._function_calls = {}
+        self._escaped_classes = {}
+        self._forwarding_cache = {}
+        self.independent_functions = self._independent_functions()
         for scope in self.owner_scopes.values():
             scope['capture_barriers'] = frozenset(scope['capture_barriers'])
         for reference in self.name_loads.get('getattr', ()):
@@ -158,16 +166,20 @@ class SanitizerBindings:
                 self.builtin_namespace = True
                 break
         for call in self.calls:
+            if call_name(call.func).rsplit('.', 1)[-1] in {'setattr', 'delattr', '__setattr__', '__delattr__'}:
+                self.reflective_member_writes = True
             if isinstance(call.func, ast.Name) and call.func.id in {'exec', 'eval', 'globals', 'locals'}:
                 self.dynamic_namespace = True
             if (isinstance(call.func, ast.Name)
                     and 'getattr' in self.name_loads
+                    and not self.in_independent_body(call)
                     and (any(isinstance(argument, ast.Starred) for argument in call.args[:2])
                          or len(call.args) >= 2 and (
-                             not isinstance(call.args[1], ast.Constant)
-                             or not isinstance(call.args[1].value, str)
-                             or call.args[1].value in {
-                                 '_getframe', 'currentframe', 'f_globals', 'f_locals', 'f_builtins'}))
+                             (names := self.attribute_name_options(call.args[1])) is None
+                             or bool(names & {
+                                 '_getframe', 'currentframe', 'f_globals', 'f_locals', 'f_builtins',
+                                 '__builtins__', '__dict__', '__getattribute__', '__getattr__',
+                                 'modules', 'import_module', 'attrgetter', 'methodcaller'})))
                     and ((resolved_lookup := self.resolve(call.func)) == ('unbound', 'getattr')
                          or call.func.id == 'getattr' and resolved_lookup is None)):
                 # An aliased or computed getattr can expose the same frame
@@ -186,6 +198,390 @@ class SanitizerBindings:
                 resolved = self.resolve(argument)
                 if resolved and resolved[0] == 'import':
                     self.escaped_imports.add(resolved[1])
+
+    def attribute_name_options(self, node, seen=frozenset()):
+        """Finite literal names on normal completion, never an arbitrary getter.
+
+        Literal lookup tables are a common way to select an ordinary field.
+        A failed lookup raises; it cannot synthesize a frame-namespace name.
+        Follow only a single earlier, unconditional lexical assignment, so
+        a parameter, branch, rebinding or reflective name stays unresolved.
+        """
+        self.budget[0] -= 1
+        if self.budget[0] < 0:
+            raise SQLFlowLimit('SQL attribute-name budget exceeded; analysis is incomplete')
+        if node in seen:
+            return None
+        seen = seen | {node}
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return frozenset({node.value})
+        if isinstance(node, ast.Name) and node.id not in self.indirect_rebindings:
+            scope = self.scope_of.get(node)
+            while scope is not None and node.id not in scope['names']:
+                previous = scope['node']
+                scope = scope['parent']
+                if not isinstance(previous, ast.ClassDef):
+                    while scope is not None and isinstance(scope['node'], ast.ClassDef):
+                        scope = scope['parent']
+            if scope is not None and len(scope['names'][node.id]) == 1:
+                assignment = self.literal_assignments.get((scope['node'], node.id))
+                if assignment is not None and assignment.lineno < node.lineno:
+                    return self.attribute_name_options(assignment.value, seen)
+            return None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = self.attribute_name_options(node.left, seen)
+            right = self.attribute_name_options(node.right, seen)
+            if left is not None and right is not None and len(left) * len(right) <= 32:
+                return frozenset(a + b for a in left for b in right)
+            return None
+        if isinstance(node, ast.Subscript):
+            if self.selector_has_opaque_effects(node.slice):
+                return None
+            if (isinstance(node.value, ast.Dict)
+                    and all(isinstance(key, ast.Constant) and type(key.value) in {str, int, float, bool, type(None)}
+                            for key in node.value.keys)):
+                values = node.value.values
+            elif isinstance(node.value, (ast.Tuple, ast.List)):
+                values = node.value.elts
+            else:
+                return None
+            if not values or len(values) > 32:
+                return None
+            choices = [self.attribute_name_options(value, seen) for value in values]
+            if all(choice is not None for choice in choices):
+                names = frozenset().union(*choices)
+                return names if len(names) <= 32 else None
+        return None
+
+    def selector_has_opaque_effects(self, node, seen=frozenset()):
+        """Do not confuse a finite field-name result with selector purity.
+
+        A constructed key, local callback protocol, or replaced selector can
+        modify SQL/namespace state while indexing the literal table. Ordinary
+        input names retain the pass's existing in-file callback boundary.
+        """
+        self.budget[0] -= 1
+        if self.budget[0] < 0:
+            raise SQLFlowLimit('SQL selector budget exceeded; analysis is incomplete')
+        if node in seen:
+            return True
+        if isinstance(node, ast.Constant) and type(node.value) in {str, int, float, bool, type(None)}:
+            return False
+        if not isinstance(node, ast.Name) or node.id in self.indirect_rebindings:
+            return True
+        scope = self.scope_of.get(node)
+        while scope is not None and node.id not in scope['names']:
+            scope = scope['parent']
+        if scope is not None:
+            if len(scope['names'][node.id]) != 1:
+                return True
+            assignment = self.literal_assignments.get((scope['node'], node.id))
+            if assignment is not None:
+                return (assignment.lineno >= node.lineno
+                        or self.selector_has_opaque_effects(assignment.value, seen | {node}))
+        return bool(self.key_callbacks)
+
+    def _independent_functions(self):
+        """Deferred, unreferenced module helpers cannot affect an in-file sink.
+
+        Keep any nested SQL spelling, namespace access, mutation of outer
+        bindings, decorator, alias or callback reference on the full path.
+        Defaults and annotations belong to the enclosing scope and are still
+        evaluated by visit_FunctionDef before this body-only admission test.
+        """
+        independent = set()
+        for function, scope in self.owner_scopes.items():
+            if (not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    or scope['parent'] is None
+                    or not isinstance(scope['parent']['node'], ast.Module)
+                    or function.decorator_list or self.name_loads.get(function.name)
+                    or len(scope['parent']['names'].get(function.name, ())) != 1
+                    or function in self.local_sql_effects()):
+                continue
+            relevant = False
+            for statement in function.body:
+                for node in ast.walk(statement):
+                    self.budget[0] -= 1
+                    if self.budget[0] < 0:
+                        raise SQLFlowLimit('SQL relevance budget exceeded; analysis is incomplete')
+                    if (isinstance(node, ast.Call) and sql_sink_name(node)
+                            or isinstance(node, (ast.Global, ast.Nonlocal))
+                            or isinstance(node, ast.Name) and node.id in {
+                                '__builtins__', '__import__', 'globals', 'locals', 'vars', 'exec', 'eval'}):
+                        relevant = True
+                        break
+                if relevant:
+                    break
+            if not relevant:
+                independent.add(function)
+        return frozenset(independent)
+
+    def in_independent_body(self, node):
+        scope = self.scope_of.get(node)
+        while scope is not None:
+            if scope['node'] in self.independent_functions:
+                return True
+            scope = scope['parent']
+        return False
+
+    def local_sql_effects(self):
+        """Reachable modeled SQL operations in stable same-file helpers.
+
+        A user-defined execute is not a database API merely by spelling.
+        Wrappers that reach an unresolved SQL-family call remain sinks at
+        their callers, including indirect wrappers and recursive groups.
+        """
+        if self._local_sql_effects is not None:
+            return self._local_sql_effects
+        functions = {node for node in self.owner_scopes
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))}
+        callers = {node: set() for node in functions}
+        effects = set()
+        for call in self.calls:
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL call graph budget exceeded; analysis is incomplete')
+            scope = self.scope_of[call]
+            while scope is not None and scope['node'] not in functions:
+                scope = scope['parent']
+            if scope is None:
+                continue
+            function = scope['node']
+            self._function_calls.setdefault(function, []).append(call)
+            target = self.resolve(call.func)
+            if target and target[0] == 'function':
+                callers[target[1]].add(function)
+            elif (sql_sink_name(call)
+                  or target and target[0] == 'import'
+                  and target[1].rsplit('.', 1)[-1] in EXECUTE_METHODS | {'extra'}):
+                effects.add(function)
+        for node, scope in self.scope_of.items():
+            if (not isinstance(node, ast.Attribute) or node in self.direct_callees
+                    or node.attr not in EXECUTE_METHODS | {'extra'}):
+                continue
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise SQLFlowLimit('SQL call graph budget exceeded; analysis is incomplete')
+            while scope is not None and scope['node'] not in functions:
+                scope = scope['parent']
+            if scope is None:
+                continue
+            target = self.resolve(node)
+            if target and target[0] == 'function':
+                callers[target[1]].add(scope['node'])
+            else:
+                # Capturing cursor.execute into an alias or passing it to a
+                # callback does not stop a local wrapper from being SQL-capable.
+                effects.add(scope['node'])
+        # Nested bodies still receive standalone analysis. Their sinks also
+        # prevent an enclosing execute wrapper from being certified non-SQL.
+        for function in functions:
+            scope = self.owner_scopes[function]['parent']
+            while scope is not None and scope['node'] not in functions:
+                scope = scope['parent']
+            if scope is not None:
+                callers[function].add(scope['node'])
+        pending = list(effects)
+        while pending:
+            for caller in callers[pending.pop()]:
+                self.budget[0] -= 1
+                if self.budget[0] < 0:
+                    raise SQLFlowLimit('SQL call graph budget exceeded; analysis is incomplete')
+                if caller not in effects:
+                    effects.add(caller)
+                    pending.append(caller)
+        self._local_sql_effects = frozenset(effects)
+        return self._local_sql_effects
+
+    def class_escapes(self, owner):
+        if owner in self._escaped_classes:
+            return self._escaped_classes[owner]
+        names = {owner.name}
+        for statement in owner.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.update(_positional_parameters(statement)[:1])
+        escaped = False
+        for name in names:
+            for reference in self.name_loads.get(name, ()):
+                target = self.resolve(reference)
+                if not target or target[0] not in {'class', 'receiver'} or target[1] is not owner:
+                    continue
+                parent = self.parents.get(reference)
+                if isinstance(parent, ast.Attribute) and parent.value is reference:
+                    # An exported bound method exposes its receiver too.
+                    member = self.resolve(parent)
+                    if member and member[0] == 'function' and parent not in self.direct_callees:
+                        escaped = True
+                        break
+                    continue
+                if target[0] == 'class' and isinstance(parent, ast.Call) and parent.func is reference:
+                    continue
+                escaped = True
+                break
+            if escaped:
+                break
+        self._escaped_classes[owner] = escaped
+        return escaped
+
+    def forwards_to_unknown(self, function, bound):
+        """Refuse a non-SQL certificate when the SQL slot escapes to a callback.
+
+        Follow raw parameter/alias text through local helper parameters. Field
+        selection from an interpreter's statement record is not raw SQL text;
+        actual SQL-family operations in any callee are checked separately.
+        """
+        cache_key = function, bound
+        if cache_key in self._forwarding_cache:
+            return self._forwarding_cache[cache_key]
+        parameters = _positional_parameters(function)[1 if bound else 0:]
+        if not parameters:
+            return True
+        pending, seen = [(function, frozenset(parameters[:1]))], set()
+        while pending:
+            current, names = pending.pop()
+            key = current, names
+            if key in seen:
+                continue
+            seen.add(key)
+            names = set(names)
+            callable_names = set()
+
+            def carries_text(value):
+                self.budget[0] -= 1
+                if self.budget[0] < 0:
+                    raise SQLFlowLimit('SQL forwarding budget exceeded; analysis is incomplete')
+                if isinstance(value, ast.Name):
+                    return value.id in names
+                if isinstance(value, ast.Attribute):
+                    return False
+                if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+                    if carries_text(value.func.value):
+                        return True
+                return any(carries_text(child) for child in ast.iter_child_nodes(value))
+
+            def carries_callable(value):
+                self.budget[0] -= 1
+                if self.budget[0] < 0:
+                    raise SQLFlowLimit('SQL callable forwarding budget exceeded; analysis is incomplete')
+                if isinstance(value, ast.Name):
+                    return value.id in callable_names
+                if isinstance(value, ast.Attribute):
+                    return carries_text(value.value) or carries_callable(value.value)
+                if isinstance(value, (ast.Subscript, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.IfExp, ast.BoolOp)):
+                    return any(carries_callable(child) for child in ast.iter_child_nodes(value))
+                return False
+
+            def exports_callable(value):
+                if isinstance(value, ast.Name):
+                    return value.id in callable_names
+                if isinstance(value, ast.Attribute):
+                    return (exports_callable(value.value)
+                            or carries_text(value.value) and callable(getattr(str, value.attr, None)))
+                if isinstance(value, (ast.Subscript, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.IfExp, ast.BoolOp)):
+                    return any(exports_callable(child) for child in ast.iter_child_nodes(value))
+                return False
+
+            changed = True
+            while changed:
+                changed = False
+                for statement in ast.walk(current):
+                    if (statement is not current
+                            and isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                            and any(isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                                    and child.id in names for child in ast.walk(statement))):
+                        return True
+                    if isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.value is not None:
+                        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                        heap_target = any(isinstance(child, (ast.Attribute, ast.Subscript))
+                                          for target in targets for child in ast.walk(target))
+                        if carries_text(statement.value):
+                            if heap_target:
+                                # Wrapping or transforming the SQL slot before
+                                # storing it does not make receiver state safe.
+                                # Without heap alias/return summaries a later
+                                # callback may recover exactly that text.
+                                return True
+                            added = {name for target in targets for name in binding_target_names(target)} - names
+                            names.update(added)
+                            changed |= bool(added)
+                        if carries_callable(statement.value):
+                            if heap_target:
+                                return True
+                            added = {name for target in targets for name in binding_target_names(target)} - callable_names
+                            callable_names.update(added)
+                            changed |= bool(added)
+                    elif isinstance(statement, (ast.NamedExpr, ast.AugAssign)) and carries_text(statement.value):
+                        if any(isinstance(child, (ast.Attribute, ast.Subscript)) for child in ast.walk(statement.target)):
+                            return True
+                        added = set(binding_target_names(statement.target)) - names
+                        names.update(added)
+                        changed |= bool(added)
+                    elif isinstance(statement, (ast.For, ast.AsyncFor, ast.comprehension)) and carries_text(statement.iter):
+                        if any(isinstance(child, (ast.Attribute, ast.Subscript)) for child in ast.walk(statement.target)):
+                            return True
+                        added = set(binding_target_names(statement.target)) - names
+                        names.update(added)
+                        changed |= bool(added)
+            for call in self._function_calls.get(current, ()):
+                if (any(isinstance(child, ast.Name) and child.id in callable_names for child in ast.walk(call.func))
+                        or any(exports_callable(value) for value in [*call.args, *(kw.value for kw in call.keywords)])):
+                    # An extracted string method remains a callable even
+                    # though an ordinary record field is not raw SQL text.
+                    # Invoking or exporting that alias requires effects the
+                    # local non-database certificate does not model.
+                    return True
+                positional = [index for index, value in enumerate(call.args) if carries_text(value)]
+                keywords = {kw.arg for kw in call.keywords if carries_text(kw.value)}
+                if not positional and not keywords:
+                    continue
+                target = self.resolve(call.func)
+                if target and target[0] == 'function':
+                    if target[1].args.vararg or target[1].args.kwarg:
+                        return True
+                    params = _positional_parameters(target[1])[1 if target[2] else 0:]
+                    selected = {params[index] for index in positional if index < len(params)}
+                    selected.update(name for name in keywords if name in _all_parameters(target[1]))
+                    if any(isinstance(value, ast.Starred) for value in call.args) or None in keywords:
+                        return True
+                    if selected:
+                        pending.append((target[1], frozenset(selected)))
+                    continue
+                if target and target[0] == 'class':
+                    owner = target[1]
+                    if owner.bases or owner.keywords:
+                        return True
+                    for decorator in owner.decorator_list:
+                        expression = decorator.func if isinstance(decorator, ast.Call) else decorator
+                        if self.resolve(expression) != ('import', 'dataclasses.dataclass'):
+                            return True
+                    if any(isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) for statement in owner.body):
+                        return True
+                    continue
+                if (target and target[0] == 'unbound' and target[1] in {
+                        'str', 'bytes', 'bytearray', 'len', 'int', 'float', 'bool', 'repr', 'format',
+                        'list', 'tuple', 'set', 'frozenset', 'dict'}):
+                    continue
+                return True
+        self._forwarding_cache[cache_key] = False
+        return False
+
+    def non_database_callable(self, call):
+        if (self.dynamic_namespace or self.builtin_namespace or self.reflective_member_writes
+                or {'__code__', '__globals__'} & self.member_writes):
+            return False
+        target = self.resolve(call.func)
+        if not target or target[0] != 'function':
+            return False
+        owner = self.owner_scopes[target[1]]['parent']
+        if owner is None:
+            return False
+        if isinstance(owner['node'], ast.ClassDef):
+            if ({'__getattribute__', '__getattr__'} & owner['names'].keys()
+                    or '__class__' in self.member_writes or self.class_escapes(owner['node'])):
+                return False
+        elif target[1].decorator_list:
+            return False
+        return target[1] not in self.local_sql_effects() and not self.forwards_to_unknown(target[1], target[2])
 
     def _scope(self, node, parent):
         scope = {'node': node, 'parent': parent, 'names': {}, 'capture_barriers': set(),
@@ -247,6 +643,8 @@ class SanitizerBindings:
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
             self.name_loads.setdefault(node.id, []).append(node)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if getattr(node, 'name', None) in {'__hash__', '__eq__', '__index__'}:
+                self.key_callbacks.add(node)
             self.parents.update((child, node.args) for child in ast.iter_child_nodes(node.args))
             for argument in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
                              *([node.args.vararg] if node.args.vararg else []),
@@ -305,6 +703,12 @@ class SanitizerBindings:
             scope['capture_barriers'].update(node.names)
             if isinstance(node, ast.Nonlocal):
                 scope['nonlocal_names'].update(node.names)
+        if (isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None
+                and self.parents.get(node) is scope['node']):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    self.literal_assignments[(scope['node'], target.id)] = node
         if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, (ast.Name, ast.Attribute)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             self._walk(node.value, scope)
@@ -656,9 +1060,11 @@ def call_name(node):
     return ''
 
 
-def sql_sink_name(node):
+def sql_sink_name(node, bindings=None):
     """Share the modeled sink families between admission and argument binding."""
     short = call_name(node.func).rsplit('.', 1)[-1]
+    if short in EXECUTE_METHODS | {'extra'} and bindings is not None and bindings.non_database_callable(node):
+        return ''
     return short if short in EXECUTE_METHODS or short == 'extra' else ''
 
 
@@ -1338,6 +1744,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.bind_value_facts([node.name], (None, None, None, False, 'unknown'))
         self.binding_sites[node.name] = frozenset({node})
         self.binding_sites[node] = frozenset({node})
+        bindings = self.ownership_bindings()
+        if (node in bindings.independent_functions
+                and not bindings.dynamic_namespace and not bindings.builtin_namespace):
+            return
         sealed = self.sealed_list_captures(node)
         if not sealed:
             sealed = self.seal_recursive_siblings(node)
@@ -3616,7 +4026,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self.store_list_item(node.target, self.value_facts(value))
 
     def sql_argument(self, node):
-        short = sql_sink_name(node)
+        short = sql_sink_name(node, self.ownership_bindings())
         if short in EXECUTE_METHODS:
             if node.args and not isinstance(node.args[0], ast.Starred):
                 return node.args[0]
@@ -3639,7 +4049,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         complete statements. Its select dictionary keys are result aliases;
         only the values are raw SQL. Do not inspect params/select_params.
         """
-        if sql_sink_name(node) != 'extra':
+        if sql_sink_name(node, self.ownership_bindings()) != 'extra':
             argument = self.sql_argument(node)
             if argument is not None:
                 yield argument, 'statement'
@@ -4880,7 +5290,9 @@ def find(files: Sequence[Path], *, max_steps=100_000) -> Iterable[tuple[str, Pat
         param_names, name_risk = build_provenance(tree)
         sanitizers = configured_sanitizers()
         budget = [max_steps]
-        bindings = SanitizerBindings(tree, configured_sanitizer_targets(), budget) if sanitizers else None
+        bindings = SanitizerBindings(tree, configured_sanitizer_targets(), budget)
+        if not any(sql_sink_name(call, bindings) for call in bindings.calls):
+            continue
         summaries = build_sanitizer_summaries(tree, sanitizers, text=text, budget=budget, bindings=bindings)
         analyzer = SQLInjectionAnalyzer(
             text,
