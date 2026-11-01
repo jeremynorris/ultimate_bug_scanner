@@ -940,13 +940,12 @@ class GuardFlow:
         keys = set().union(*(branch.values for branch in branches))
         state.values = {key: self.merged(branch.values.get(key, Value()) for branch in branches) for key in keys}
 
-    def note_exception(self, state):
+    def note_exception(self, state: State):
         if not self.exceptions:
             return
         pending = self.exceptions[-1]
         signature = state.signature()
         self.budget.spend(len(pending) + 1)
-        # signature() is this flow state's (exit, sorted values) fingerprint, compared to drop duplicate states; no secret is involved — ubs:ignore[python.ctcompare.secret_eq]
         if all(previous.signature() != signature for previous in pending):
             pending.append(state.copy())
             if len(pending) > 128:

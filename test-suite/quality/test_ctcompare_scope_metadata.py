@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -389,6 +390,215 @@ class CallResultMetadataTests(unittest.TestCase):
         # A scalar call result, a secret-named member, a name that was also
         # assigned a secret alias, and a member read before assignment.
         self.assertEqual(scan_lines('js', source), [7, 8, 9, 10, 11], source)
+
+
+class StructuralFingerprintTests(unittest.TestCase):
+    """GH #195: local record fingerprints have a role; the name alone does not."""
+
+    RECORDS = textwrap.dedent('''\
+        from dataclasses import dataclass, field
+        @dataclass(frozen=True)
+        class Value:
+            status: int = 0
+            origins: frozenset[str] = frozenset()
+        @dataclass
+        class State:
+            exit: str = ""
+            values: dict[str, Value] = field(default_factory=dict)
+            def signature(self):
+                return self.exit, tuple(sorted(self.values.items()))
+    ''')
+
+    def reports(self, suffix, prefix=None):
+        source = (self.RECORDS if prefix is None else prefix) + textwrap.dedent(suffix)
+        return [code for _path, _line, code in ctcompare_py._scan_code(source)]
+
+    def test_state_fingerprints_in_typed_pending_collection(self):
+        self.assertEqual(self.reports('''
+            class Flow:
+                def __init__(self):
+                    self.exceptions: list[list[State]] = []
+                def note_exception(self, state: State):
+                    if not self.exceptions:
+                        return
+                    pending = self.exceptions[-1]
+                    signature = state.signature()
+                    if all(previous.signature() != signature for previous in pending):
+                        pending.append(state)
+        '''), [])
+
+    def test_constructor_result_and_single_assignment_aliases(self):
+        self.assertEqual(self.reports('''
+            def check():
+                state = State()
+                signature = state.signature()
+                saved_signature = signature
+                return saved_signature == State().signature()
+        '''), [])
+
+    def test_unknown_signature_method_and_parameter_stay_reported(self):
+        source = 'def is_new(pending, signature):\n    return all(previous.signature() != signature for previous in pending)\n'
+        self.assertEqual(scan_lines('python', source), [2])
+        self.assertEqual(self.reports('''
+            def verify(unrelated, expected):
+                return unrelated.signature() == expected
+        '''), ['return unrelated.signature() == expected'])
+
+    def test_real_secret_operands_win_over_public_fingerprint(self):
+        self.assertEqual(self.reports('''
+            def verify(state: State, password, expected, secret):
+                password = state.signature()
+                public = state.signature()
+                return password == expected, public == secret
+        '''), ['return password == expected, public == secret'])
+        self.assertEqual(self.reports('''
+            import hmac
+            def verify(state: State, key, body):
+                return state.signature() == hmac.new(key, body, 'sha256').digest()
+        '''), ["return state.signature() == hmac.new(key, body, 'sha256').digest()"])
+
+    def test_secret_bearing_tuple_and_security_qualified_method_stay_reported(self):
+        for body in ('return self.password, tuple(sorted(self.values.items()))',
+                     'return hmac.new(self.exit, self.values).digest(), 0',
+                     'return unknown(), tuple(sorted(self.values.items()))'):
+            with self.subTest(body=body):
+                prefix = self.RECORDS.replace('return self.exit, tuple(sorted(self.values.items()))', body)
+                self.assertEqual(self.reports('''
+                    def verify(state: State, expected):
+                        return state.signature() == expected
+                ''', prefix), ['return state.signature() == expected'])
+        prefix = self.RECORDS.replace('def signature(self)', 'def hmac_signature(self)')
+        self.assertEqual(self.reports('''
+            def verify(state: State, expected):
+                return state.hmac_signature() == expected
+        ''', prefix), ['return state.hmac_signature() == expected'])
+
+    def test_opaque_tuple_and_constructor_alias_do_not_prove_public(self):
+        for initialize in ('self.value = password', 'self.value = hmac.new(key, body).digest()'):
+            with self.subTest(initialize=initialize):
+                prefix = ('class Record:\n'
+                          '    def __init__(self, password, key, body):\n'
+                          f'        {initialize}\n'
+                          '    def signature(self):\n'
+                          '        return (self.value,)\n')
+                self.assertEqual(self.reports('''
+                    def verify(record: Record, expected):
+                        return record.signature() == expected
+                ''', prefix), ['return record.signature() == expected'])
+        prefix = self.RECORDS.replace('    def signature(self):',
+                                    '    def __init__(self, password):\n        self.exit = password\n'
+                                    '    def signature(self):')
+        self.assertEqual(self.reports('''
+            def verify(state: State, expected):
+                return state.signature() == expected
+        ''', prefix), ['return state.signature() == expected'])
+
+    def test_rebinding_and_misleading_local_annotations_do_not_prove_receiver(self):
+        cases = (
+            'def verify(state: State, other, expected):\n    state = other\n    return state.signature() == expected\n',
+            'def verify(state: State, other, flag, expected):\n    if flag:\n        state = other\n    return state.signature() == expected\n',
+            'def verify(other, expected):\n    state: State = other\n    return state.signature() == expected\n',
+            'def verify(State, expected):\n    state = State()\n    return state.signature() == expected\n',
+            'State = foreign_class\ndef verify(state: State, expected):\n    return state.signature() == expected\n',
+            'def verify(password, expected):\n    state = State(password)\n    return state.signature() == expected\n',
+            'def verify(password, expected):\n    payload = password\n    state = State({"x": Value(payload)})\n    return state.signature() == expected\n',
+            'def verify(state: State, password, expected):\n    state.values = {"x": Value(password)}\n    return state.signature() == expected\n',
+            'def verify(state: State, password, expected):\n    payload = password\n    state.values["x"] = Value(payload)\n    return state.signature() == expected\n',
+            'def verify(state: State, password, expected):\n    state.values.update({"x": Value(password)})\n    return state.signature() == expected\n',
+            'def verify(state: State, password, expected):\n    state.exit: str = password\n    return state.signature() == expected\n',
+            'def verify(state: State, password, expected):\n    state.values |= {"x": password}\n    return state.signature() == expected\n',
+            'def verify(secret: State, expected):\n    state = secret\n    return state.signature() == expected\n',
+            'def verify(state: State, password, expected):\n    values = state.values\n    values["x"] = password\n    return state.signature() == expected\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.reports(source), ['return state.signature() == expected'])
+
+    def test_monkey_patches_reflection_and_escaped_objects_remain_sensitive(self):
+        cases = (
+            'State.signature = get_password\ndef verify(state: State, expected):\n    return state.signature() == expected\n',
+            'mutate(State)\ndef verify(state: State, expected):\n    return state.signature() == expected\n',
+            'def verify(state: State, expected):\n    mutate(state)\n    return state.signature() == expected\n',
+            'def verify(state: State, expected):\n    alias = state\n    mutate(alias)\n    return state.signature() == expected\n',
+            'setattr(State, "signature", get_password)\ndef verify(state: State, expected):\n    return state.signature() == expected\n',
+            'Alias = State\nmutate(Alias)\ndef verify(state: State, expected):\n    return state.signature() == expected\n',
+            'def verify(state: State, expected):\n    mutate([state])\n    return state.signature() == expected\n',
+            'def verify(state: State, expected):\n    holder = [state]\n    mutate(holder)\n    return state.signature() == expected\n',
+            'def verify(state: State, expected):\n    holder: list[State] = [state]\n    mutate(holder)\n    return state.signature() == expected\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.reports(source), ['return state.signature() == expected'])
+
+    def test_subclasses_custom_new_descriptors_and_factories_stay_sensitive(self):
+        prefixes = (
+            self.RECORDS + 'class Credential(State):\n    def signature(self):\n        return self.password\n',
+            self.RECORDS.replace('    def signature(self):',
+                                 '    def __new__(cls):\n        return credential\n    def signature(self):'),
+            self.RECORDS.replace('    def signature(self):',
+                                 '    @property\n    def exit(self):\n        return self.password\n    def signature(self):'),
+            self.RECORDS.replace('field(default_factory=dict)', 'field(default_factory=get_password)'),
+            self.RECORDS.replace('@dataclass\nclass State', '@dataclass(frozen=dynamic())\nclass State'),
+            self.RECORDS.replace('values: dict[str, Value]', 'values: dict[str, object]'),
+            self.RECORDS.replace('status: int = 0', 'data: str = ""'),
+            self.RECORDS.replace('exit: str = ""', 'exit: str = "hunter2"'),
+            self.RECORDS.replace('    def signature(self):',
+                                 '    def __post_init__(self):\n        self.exit = password\n    def signature(self):'),
+        )
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.reports('''
+                    def verify(state: State, expected):
+                        return state.signature() == expected
+                ''', prefix), ['return state.signature() == expected'])
+
+    def test_secret_constructor_or_field_write_in_caller_defeats_record_contract(self):
+        for prepare in ('state = State({"x": Value(payload)})',
+                        'state = State()\n    state.exit = payload',
+                        'state = State()\n    fields = state.values\n    fields["x"] = payload',
+                        'state = State()\n    fields = state.values\n    alias = fields\n    alias["x"] = payload'):
+            source = ('def caller(password, expected):\n'
+                      '    payload = password\n'
+                      f'    {prepare}\n'
+                      '    return verify(state, expected)\n'
+                      'def verify(state: State, expected):\n'
+                      '    return state.signature() == expected\n')
+            with self.subTest(prepare=prepare):
+                self.assertEqual(self.reports(source), ['return state.signature() == expected'])
+
+    def test_fingerprint_role_does_not_cross_shadowing_scopes(self):
+        self.assertEqual(self.reports('''
+            def outer(state: State):
+                signature = state.signature()
+                def inner(signature, expected):
+                    return signature == expected
+                return lambda signature: signature == "supplied"
+        '''), ['return signature == expected', 'return lambda signature: signature == "supplied"'])
+        self.assertEqual(self.reports('''
+            def verify(state: State, unknown, expected):
+                return all(state.signature() == expected for state in unknown)
+        '''), ['return all(state.signature() == expected for state in unknown)'])
+        self.assertEqual(self.reports('''
+            def verify(passwords: list[State], expected):
+                return all(state.signature() == expected for state in passwords)
+        '''), ['return all(state.signature() == expected for state in passwords)'])
+        self.assertEqual(self.reports('''
+            def verify(state: State, password, expected):
+                checks = (state.signature() == expected for index in [0])
+                state.exit = password
+                return all(checks)
+        '''), ['checks = (state.signature() == expected for index in [0])'])
+        self.assertEqual(self.reports('''
+            def verify(state: State, expected):
+                ignored = [mutate(state) for index in [0]]
+                return state.signature() == expected
+        '''), ['return state.signature() == expected'])
+
+    def test_actual_csharp_state_fingerprint_needs_no_suppression(self):
+        path = HELPERS_DIR / 'ubs_core/analyzers/narrowing_csharp.py'
+        source = path.read_text(encoding='utf-8')
+        self.assertNotIn('ubs:ignore[python.ctcompare.secret_eq]', source)
+        self.assertEqual(ctcompare_py._scan_code(source), [])
 
 
 if __name__ == "__main__":

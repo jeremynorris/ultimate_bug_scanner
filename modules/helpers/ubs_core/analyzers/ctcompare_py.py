@@ -26,6 +26,10 @@ categorical label. Only literal enum-like strings, immutable scalar aliases,
 and dictionaries with no writes or escapes establish that role. Unknown
 signal data, conditional/repeated bindings, security-qualified names, and a
 sensitive operand on either side of the comparison remain reported.
+
+Structural role (GH #195): a resolved local method returning a public tuple
+can be an analysis-state fingerprint. The method body and receiver contract
+must both support that role; an unresolved ``signature()`` is still sensitive.
 """
 
 from __future__ import annotations
@@ -356,6 +360,494 @@ def is_constant_display(node):
     )
 
 
+class StructuralFingerprints(ast.NodeVisitor):
+    """Resolve a small, closed set of public tuple-producing local methods.
+
+    An annotation alone never proves a return value public: the local class
+    must have an ordinary, undecorated method with a single tuple return made
+    from non-secret fields and structural builtins. Unknown calls, inheritance,
+    descriptors, rebinding and namespace reflection defeat the proof. Typed
+    parameters and container fields express receiver contracts; assignments
+    cannot replace those contracts with unknown values unnoticed.
+    """
+
+    def __init__(self, tree):
+        self.public = set()
+        self.env = {}
+        self.owner = None
+        self.direct = set(tree.body)
+        self.writes = {}
+        self.classes = {}
+        self.fields = {}
+        self.methods = set()
+        self.record_fields = {}
+        self.literal_names = set()
+        self.field_names = set()
+        nodes = list(ast.walk(tree))
+        reflection = {
+            'getattr', 'setattr', 'delattr', 'vars', 'globals', 'locals', 'eval',
+            'exec', '__dict__', '__getattribute__', '__getattr__', '__setattr__',
+            '_getframe', 'currentframe', 'f_globals', 'f_locals', '__builtins__',
+        }
+        if any(
+            isinstance(node, ast.Name) and node.id in reflection
+            or isinstance(node, ast.Attribute) and node.attr in reflection
+            or isinstance(node, ast.alias) and node.name.rsplit('.', 1)[-1] in reflection
+            for node in nodes
+        ):
+            return
+        writes = self.binding_counts(nodes)
+        self.all_writes = writes
+        secret_fields, secret_constructors = set(), set()
+        for scope in nodes:
+            if not isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            local_nodes = self.lexical_nodes(scope)
+            assignments = [item for item in local_nodes if isinstance(item, (ast.Assign, ast.AnnAssign, ast.NamedExpr))]
+            secret_aliases = set()
+            field_aliases = {}
+
+            def secret_value(value):
+                return value is not None and any(
+                    isinstance(part, ast.Name) and (part.id in secret_aliases or name_is_sensitive(part.id))
+                    or isinstance(part, ast.Attribute) and name_is_sensitive(part.attr)
+                    for part in ast.walk(value)
+                )
+
+            changed = True
+            while changed:
+                before = len(secret_aliases), sum(map(len, field_aliases.values()))
+                for item in assignments:
+                    targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+                    if secret_value(item.value):
+                        secret_aliases.update(name for target in targets for name in target_names(target))
+                    if isinstance(item.value, (ast.Name, ast.Attribute, ast.Subscript)):
+                        fields = {part.attr for part in ast.walk(item.value) if isinstance(part, ast.Attribute)}
+                        for part in ast.walk(item.value):
+                            if isinstance(part, ast.Name):
+                                fields.update(field_aliases.get(part.id, ()))
+                        for target in targets:
+                            for name in target_names(target):
+                                field_aliases.setdefault(name, set()).update(fields)
+                changed = (len(secret_aliases), sum(map(len, field_aliases.values()))) != before
+            secret_fields.update(
+                part.attr for item in assignments if secret_value(item.value)
+                for target in (item.targets if isinstance(item, ast.Assign) else [item.target])
+                for part in ast.walk(target) if isinstance(part, ast.Attribute)
+            )
+            # A typed callee must not re-certify a field that its caller filled
+            # with a secret through a local mutable alias (fields = state.values).
+            secret_fields.update(
+                field for item in assignments if secret_value(item.value)
+                for target in (item.targets if isinstance(item, ast.Assign) else [item.target])
+                for access in ast.walk(target) if isinstance(access, (ast.Attribute, ast.Subscript))
+                for part in ast.walk(access) if isinstance(part, ast.Name)
+                for field in field_aliases.get(part.id, ())
+            )
+            secret_constructors.update(
+                item.func.id for item in local_nodes if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)
+                and any(secret_value(value) for value in [*item.args, *(kw.value for kw in item.keywords)])
+            )
+        annotations = set()
+        for item in nodes:
+            annotation = (item.annotation if isinstance(item, (ast.arg, ast.AnnAssign))
+                          else item.returns if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) else None)
+            if annotation is not None:
+                annotations.update(ast.walk(annotation))
+        module_writes = self.binding_counts(self.lexical_nodes(tree))
+        parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
+        self.parents = parents
+        for statement in tree.body:
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    names = target_names(target)
+                    values = (statement.value.elts if isinstance(statement.value, ast.Tuple)
+                              and isinstance(target, ast.Tuple) else [statement.value])
+                    if len(names) == len(values):
+                        self.literal_names.update(name for name, value in zip(names, values)
+                                                  if isinstance(value, ast.Constant) and self.public_default(value, writes)
+                                                  and writes.get(name) == 1)
+        replaced = {
+            node.attr for node in nodes
+            if isinstance(node, ast.Attribute) and not isinstance(node.ctx, ast.Load)
+        }
+        inherited = {
+            base.id for node in nodes if isinstance(node, ast.ClassDef)
+            for base in node.bases if isinstance(base, ast.Name)
+        }
+        dataclass_names = {
+            item.asname or item.name for statement in tree.body
+            if isinstance(statement, ast.ImportFrom) and statement.module == 'dataclasses'
+            for item in statement.names if item.name == 'dataclass'
+        }
+        self.field_names = {
+            item.asname or item.name for statement in tree.body
+            if isinstance(statement, ast.ImportFrom) and statement.module == 'dataclasses'
+            for item in statement.names
+            if item.name == 'field' and module_writes.get(item.asname or item.name) == 1
+        }
+        for node in tree.body:
+            if (not isinstance(node, ast.ClassDef) or writes.get(node.name) != 1
+                    or node.name in secret_constructors):
+                continue
+            decorators = [value.func if isinstance(value, ast.Call) else value
+                          for value in node.decorator_list]
+            if node.bases or node.keywords or node.name in inherited or any(
+                not isinstance(value, ast.Name) or value.id not in dataclass_names
+                or writes.get(value.id) != 1 for value in decorators
+            ):
+                continue
+            if any(isinstance(value, ast.Call) and (value.args or any(
+                not isinstance(keyword.value, ast.Constant) or not isinstance(keyword.value.value, bool)
+                for keyword in value.keywords
+            )) for value in node.decorator_list):
+                continue
+            # A class passed as a value can be monkey-patched by unknown code.
+            if any(isinstance(item, ast.Name) and item.id == node.name
+                   and isinstance(item.ctx, ast.Load) and item not in annotations
+                   and not (isinstance(parents.get(item), ast.Call) and parents[item].func is item)
+                   for item in nodes):
+                continue
+            # A property can compute a secret even when its name is innocuous.
+            if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and (item.name in {'__getattribute__', '__getattr__', '__new__'} or any(
+                       not isinstance(value, ast.Name) or value.id not in {'staticmethod', 'classmethod'}
+                       for value in item.decorator_list
+                   )) for item in node.body):
+                continue
+            self.classes[node.name] = node
+            self.record_fields[node.name] = {
+                item.target.id: item for item in node.body
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+            }
+            class_bindings = {
+                name for item in node.body if isinstance(item, ast.Assign)
+                for target in item.targets for name in target_names(target)
+            } | set(self.record_fields[node.name])
+            if self.field_names.intersection(class_bindings):
+                self.record_fields[node.name] = {}
+            if secret_fields.intersection(self.record_fields[node.name]):
+                self.record_fields[node.name] = {}
+        for name, node in self.classes.items():
+            fields = {}
+            for item in ast.walk(node):
+                if isinstance(item, ast.AnnAssign):
+                    if isinstance(item.target, ast.Name):
+                        fields[item.target.id] = item.annotation
+                    elif isinstance(item.target, ast.Attribute) and isinstance(item.target.value, ast.Name):
+                        if item.target.value.id == 'self':
+                            fields[item.target.attr] = item.annotation
+            self.fields[name] = fields
+            if not self.public_record(name, writes, set()):
+                continue
+            for method in node.body:
+                if (not isinstance(method, ast.FunctionDef) or method.name in replaced
+                        or method.decorator_list):
+                    continue
+                terms = set(identifier_terms(method.name)) - CODE_SIGNATURE_TERMS
+                if terms.intersection(STRONG_TERMS | WEAK_TERMS | QUALIFIER_TERMS):
+                    continue
+                args = method.args.posonlyargs + method.args.args
+                body = [item for item in method.body if not (
+                    isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant)
+                    and isinstance(item.value.value, str)
+                )]
+                if (len(args) == 1 and not method.args.kwonlyargs
+                        and not method.args.vararg and not method.args.kwarg
+                        and len(body) == 1 and isinstance(body[0], ast.Return)
+                        and isinstance(body[0].value, ast.Tuple)
+                        and self.public_expression(body[0].value, args[0].arg, writes, name)
+                        and any(isinstance(item, ast.Attribute) and item.attr in fields
+                                and any(isinstance(part, ast.Name) and part.id in self.classes
+                                        for part in ast.walk(fields[item.attr]))
+                                for item in ast.walk(body[0].value))):
+                    self.methods.add((name, method.name))
+        self.writes = self.binding_counts(nodes)
+        if self.methods:
+            self.visit(tree)
+
+    @staticmethod
+    def lexical_nodes(root):
+        nodes = []
+        pending = list(ast.iter_child_nodes(root))
+        while pending:
+            item = pending.pop()
+            nodes.append(item)
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                pending.extend(ast.iter_child_nodes(item))
+        return nodes
+
+    @staticmethod
+    def binding_counts(nodes):
+        counts = {}
+        for node in nodes:
+            name = None
+            if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+                name = node.id
+            elif isinstance(node, ast.arg):
+                name = node.arg
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = node.name
+            elif isinstance(node, ast.alias):
+                name = node.asname or node.name.split('.')[0]
+            elif isinstance(node, ast.ExceptHandler):
+                name = node.name
+            elif isinstance(node, tuple(getattr(ast, kind) for kind in (
+                'MatchAs', 'MatchStar', 'TypeVar', 'ParamSpec', 'TypeVarTuple',
+            ) if hasattr(ast, kind))):
+                name = node.name
+            elif isinstance(node, getattr(ast, 'MatchMapping', ())):
+                name = node.rest
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                for value in node.names:
+                    counts[value] = counts.get(value, 0) + 2
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    def public_default(self, node, writes):
+        if isinstance(node, ast.Constant):
+            return node.value is None or isinstance(node.value, (bool, int, float)) or node.value == ''
+        if isinstance(node, ast.Name):
+            return node.id in self.literal_names
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in {'dict', 'list', 'set', 'tuple', 'frozenset'}:
+                return node.func.id not in writes and not node.args and not node.keywords
+            if node.func.id in self.field_names and not node.args:
+                return bool(node.keywords) and all(
+                    keyword.arg == 'default_factory' and isinstance(keyword.value, ast.Name)
+                    and keyword.value.id in {'dict', 'list', 'set', 'tuple', 'frozenset'}
+                    and keyword.value.id not in writes
+                    or keyword.arg == 'default' and self.public_default(keyword.value, writes)
+                    for keyword in node.keywords
+                )
+        return False
+
+    def public_annotation(self, node, writes, active, field=''):
+        if isinstance(node, ast.Name):
+            metadata = {term.rstrip('s') for term in identifier_terms(field)}
+            return (node.id in {'int', 'float', 'bool'} and node.id not in writes
+                    or node.id == 'str' and node.id not in writes
+                    and bool(metadata.intersection(METADATA_TERMS | {'exit', 'origin', 'path', 'identifier'}))
+                    or self.public_record(node.id, writes, active))
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            if node.value.id in {'dict', 'list', 'set', 'tuple', 'frozenset'} and node.value.id not in writes:
+                items = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                return all(self.public_annotation(item, writes, active,
+                                                  'name' if node.value.id == 'dict' and index == 0 else field)
+                           for index, item in enumerate(items))
+        return False
+
+    def public_record(self, name, writes, active):
+        fields = self.record_fields.get(name, {})
+        if not fields or name in active or any(
+            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name in {'__init__', '__post_init__'}
+            for item in self.classes[name].body
+        ):
+            return False
+        return all(not name_is_sensitive(field) and self.public_default(item.value, writes)
+                   and self.public_annotation(item.annotation, writes, active | {name}, field)
+                   for field, item in fields.items())
+
+    def public_expression(self, node, receiver, writes, owner):
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return all(self.public_expression(item, receiver, writes, owner) for item in node.elts)
+        if isinstance(node, ast.Attribute):
+            return (isinstance(node.value, ast.Name) and node.value.id == receiver
+                    and node.attr in self.record_fields[owner])
+        if isinstance(node, ast.Call) and not node.keywords:
+            if isinstance(node.func, ast.Name) and node.func.id in {'tuple', 'sorted', 'frozenset'}:
+                return (node.func.id not in writes and len(node.args) == 1
+                        and self.public_expression(node.args[0], receiver, writes, owner))
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {'items', 'keys', 'values'}:
+                return not node.args and self.public_expression(node.func.value, receiver, writes, owner)
+        return False
+
+    def annotation_type(self, node):
+        if isinstance(node, ast.Name) and node.id in self.classes:
+            return ('instance', node.id)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            if node.value.id in {'list', 'set', 'frozenset'} and node.value.id not in self.all_writes:
+                element = self.annotation_type(node.slice)
+                return ('sequence', element) if element else None
+        return None
+
+    def value_type(self, node):
+        if isinstance(node, ast.Name):
+            return self.env.get(node.id) or (('secret', None) if name_is_sensitive(node.id) else None)
+        if isinstance(node, ast.Attribute):
+            receiver = self.value_type(node.value)
+            if receiver and receiver[0] == 'instance':
+                return self.annotation_type(self.fields.get(receiver[1], {}).get(node.attr))
+        if isinstance(node, ast.Subscript):
+            receiver = self.value_type(node.value)
+            if receiver and receiver[0] == 'sequence' and not isinstance(node.slice, ast.Slice):
+                return receiver[1]
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in self.classes:
+                # Defaults were checked with the record body. Arbitrary
+                # constructor inputs need deeper field provenance than this
+                # bounded role proof supplies, even when their names are plain.
+                if not node.args and not node.keywords:
+                    return ('instance', node.func.id)
+            if isinstance(node.func, ast.Attribute) and not node.args and not node.keywords:
+                receiver = self.value_type(node.func.value)
+                if (receiver and (receiver[1], node.func.attr) in self.methods
+                        and not name_is_sensitive(call_name(node.func.value))):
+                    return ('fingerprint', None)
+        if node is not None and any(
+            isinstance(part, ast.Name) and self.value_type(part) == ('secret', None)
+            or isinstance(part, ast.Attribute) and name_is_sensitive(part.attr)
+            for part in ast.walk(node)
+        ):
+            return ('secret', None)
+        return None
+
+    def visit_ClassDef(self, node):
+        old_owner = self.owner
+        self.owner = node.name if node.name in self.classes else None
+        for statement in node.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.visit(statement)
+        self.owner = old_owner
+
+    def visit_FunctionDef(self, node):
+        previous = self.env, self.writes, self.direct
+        self.env = {}
+        self.writes = self.binding_counts(ast.walk(node))
+        self.direct = set(node.body)
+        args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+        method = self.owner and node in self.classes[self.owner].body
+        for index, arg in enumerate(args):
+            if self.writes.get(arg.arg) == 1:
+                terms = identifier_terms(arg.arg)
+                sensitive = (name_is_sensitive(arg.arg)
+                             or name_is_sensitive('_'.join(term[:-1] if term.endswith('s') else term
+                                                           for term in terms)))
+                self.env[arg.arg] = (('secret', None) if sensitive
+                                    else ('instance', self.owner) if index == 0 and method
+                                    else self.annotation_type(arg.annotation))
+        for statement in node.body:
+            self.visit(statement)
+        self.env, self.writes, self.direct = previous
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node):
+        old_env = self.env
+        self.env = {}
+        self.visit(node.body)
+        self.env = old_env
+
+    def visit_Assign(self, node):
+        self.visit(node.value)
+        if (isinstance(node.value, (ast.List, ast.Tuple, ast.Set, ast.Dict))
+                or self.value_type(node.value) is None):
+            self.invalidate_receivers([node.value])
+        value = self.value_type(node.value) if node in self.direct else None
+        for target in node.targets:
+            if isinstance(target, (ast.Attribute, ast.Subscript)):
+                self.invalidate_receivers([target])
+            for name in target_names(target):
+                self.env[name] = value if self.writes.get(name) == 1 else None
+
+    def visit_AnnAssign(self, node):
+        if node.value:
+            self.visit(node.value)
+            if (isinstance(node.value, (ast.List, ast.Tuple, ast.Set, ast.Dict))
+                    or self.value_type(node.value) is None):
+                self.invalidate_receivers([node.value])
+        if isinstance(node.target, ast.Name):
+            self.env[node.target.id] = (
+                self.value_type(node.value)
+                if node in self.direct and self.writes.get(node.target.id) == 1 else None
+            )
+        else:
+            self.invalidate_receivers([node.target])
+
+    def visit_AugAssign(self, node):
+        self.visit(node.value)
+        self.invalidate_receivers([node.target])
+
+    def visit_Delete(self, node):
+        self.invalidate_receivers(node.targets)
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and self.env.get(node.id) == ('fingerprint', None):
+            # A public tuple cannot explain an independently security-qualified name.
+            terms = set(identifier_terms(node.id)) - CODE_SIGNATURE_TERMS
+            if not terms.intersection(STRONG_TERMS | WEAK_TERMS | QUALIFIER_TERMS):
+                self.public.add(node)
+
+    def visit_Call(self, node):
+        public = self.value_type(node) == ('fingerprint', None)
+        if public:
+            self.public.add(node)
+        self.generic_visit(node)
+        if self.reads_length(node):
+            return  # builtin len does not mutate a typed builtin container
+        arguments = [*node.args, *(item.value for item in node.keywords)]
+        if not public and isinstance(node.func, ast.Attribute):
+            arguments.append(node.func.value)
+        self.invalidate_receivers(arguments)
+
+    def reads_length(self, node):
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'len'
+                and 'len' not in self.all_writes and len(node.args) == 1 and not node.keywords
+                and (value := self.value_type(node.args[0])) and value[0] == 'sequence')
+
+    def invalidate_receivers(self, expressions):
+        escaped = set()
+        pending = list(expressions)
+        while pending:
+            part = pending.pop()
+            if self.reads_length(part):
+                continue
+            if isinstance(part, ast.Name) and (value := self.env.get(part.id)):
+                if value[0] in {'instance', 'sequence'}:
+                    escaped.add(value)
+            pending.extend(ast.iter_child_nodes(part))
+        if escaped:
+            self.env = {name: None if value in escaped else value for name, value in self.env.items()}
+
+    def visit_GeneratorExp(self, node):
+        old_env = self.env
+        self.env = dict(old_env)
+        if isinstance(node, ast.GeneratorExp):
+            parent = self.parents.get(node)
+            if not (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+                    and parent.func.id in {'all', 'any'} and parent.func.id not in self.all_writes
+                    and len(parent.args) == 1 and not parent.keywords):
+                # Deferred generators can run after a receiver changes. Only
+                # the eager builtin consumers justify the current environment.
+                self.env = {}
+        local_names = set()
+        for generator in node.generators:
+            self.visit(generator.iter)
+            value = self.value_type(generator.iter)
+            for name in target_names(generator.target):
+                local_names.add(name)
+                self.env[name] = (value[1] if value and value[0] == 'sequence'
+                                  and isinstance(generator.target, ast.Name) else None)
+            for condition in generator.ifs:
+                self.visit(condition)
+        if isinstance(node, ast.DictComp):
+            self.visit(node.key)
+            self.visit(node.value)
+        else:
+            self.visit(node.elt)
+        for name, value in old_env.items():
+            if name not in local_names and self.env.get(name) != value:
+                old_env[name] = None
+        self.env = old_env
+
+    visit_ListComp = visit_GeneratorExp
+    visit_SetComp = visit_GeneratorExp
+    visit_DictComp = visit_GeneratorExp
+
+
 class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
     def __init__(self, path, lines, suppressions=None):
         self.path = path
@@ -376,6 +868,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         # binding (`sig = self._call_signature(node)`).
         self.explained_names = set()
         self.public_signal_bindings = {}
+        self.structural_values = set()
         self.issues = []
         self.seen_lines = set()
 
@@ -392,6 +885,8 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         self.issues.append((self.relative_path(), line_no, source_line(self.lines, line_no)))
 
     def expr_is_sensitive(self, node):
+        if node in self.structural_values:
+            return False
         if isinstance(node, ast.Name):
             return node.id in self.sensitive_names or (
                 node.id not in self.explained_names and name_is_sensitive(node.id)
@@ -504,6 +999,10 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
 
     def visit_AsyncFunctionDef(self, node):
         self.visit_FunctionDef(node)
+
+    def visit_Module(self, node):
+        self.structural_values = StructuralFingerprints(node).public
+        self.generic_visit(node)
 
     def visit_Assign(self, node):
         names = [name for target in node.targets for name in target_names(target)]
