@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import unquote, urlsplit
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "modules/helpers"))
@@ -329,6 +330,7 @@ if name == "ast-grep":
     elif "--json=stream" not in sys.argv: print("[]")
     raise SystemExit(0)
 if name == "go" and "run" in sys.argv:
+    sys.stdout.write(os.environ.get("GO_TEST_LIFECYCLE", ""))
     raise SystemExit(0)
 key = {"go":"vet", "gofmt":"gofmt", "govulncheck":"vuln"}[name]
 with open(os.environ["GO_TEST_LOG"], "a") as log:
@@ -403,6 +405,32 @@ class Integration(unittest.TestCase):
         self.assertTrue(wanted <= {f["rule"] for f in doc["findings"]})
         self.assertTrue(wanted <= {json.loads(s)["rule"] for s in sidecar.read_text().splitlines()})
         self.assertEqual({json.loads(s)["cwd"] for s in self.log.read_text().splitlines()}, {str(self.root)})
+
+    def test_lifecycle_malformed_locations_preserve_rows_and_text(self) -> None:
+        locations = {
+            "no-colon.go": ("no-colon.go", 0),
+            "bad.go:not-a-line": ("bad.go:not-a-line", 0),
+            "empty.go:": ("empty.go:", 0),
+            "colon:name.go:9": ("colon:name.go", 9),
+        }
+        output = "".join(f"{location}\tfile_handle\tleaked file\n" for location in locations)
+        for fmt in ("json", "text"):
+            with self.subTest(format=fmt):
+                result = subprocess.run(
+                    [str(REPO / "ubs"), "--ci", "--no-config", "--only=golang",
+                     "--fail-on-warning", f"--format={fmt}", str(self.root)],
+                    cwd=self.base, env=dict(self.env, GO_TEST_LIFECYCLE=output),
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+                if fmt == "json":
+                    doc = json.loads(result.stdout)
+                    self.assertEqual(doc["status"], "ok")
+                    rows = [row for row in doc["findings"] if row["rule_id"] == "go.lifecycle.file_handle"]
+                    self.assertCountEqual([(row["file"], row["line"]) for row in rows], locations.values())
+                else:
+                    for location in locations:
+                        self.assertIn(f"    {location}  ", result.stdout)
 
     def test_vet_failure_preserves_findings_and_marks_partial(self) -> None:
         result = self.scan("--go-tools", "--format=json", vet="error", vuln="finding")
@@ -500,6 +528,47 @@ class Integration(unittest.TestCase):
 class RealGoTools(unittest.TestCase):
     setUp = Adapters.setUp
     rows = Adapters.rows
+
+    def test_resource_lifecycle_locations_preserve_filename_and_line(self) -> None:
+        names = ("plain.go", "space name.go", "colon:name.go", "unicode-µ#%?.go")
+        for number, name in enumerate(names):
+            (self.root / name).write_text(
+                'package main\n\nimport "os"\n\n'
+                f'func leak{number}() {{\n    file, _ := os.Open("input")\n    _ = file\n}}\n'
+            )
+        before = {p.name: p.read_bytes() for p in self.root.iterdir() if p.is_file()}
+        env = dict(os.environ, NO_COLOR="1", UBS_NO_AUTO_UPDATE="1", UBS_NO_CACHE="1",
+                   PYTHONDONTWRITEBYTECODE="1", GOTOOLCHAIN="local", GOPROXY="off", GOSUMDB="off")
+        for fmt in ("json", "sarif"):
+            with self.subTest(format=fmt):
+                result = subprocess.run(
+                    ["bash", str(REPO / "ubs"), "--ci", "--no-config", "--no-auto-update",
+                     "--only=golang", f"--format={fmt}", str(self.root)],
+                    cwd=REPO, env=env, capture_output=True, text=True, timeout=90,
+                )
+                self.assertIn(result.returncode, (0, 1), result.stderr + result.stdout)
+                report = json.loads(result.stdout)
+                locations = []
+                if fmt == "json":
+                    self.assertEqual(report["status"], "ok")
+                    self.assertEqual(report["failed_modules"], [])
+                    for finding in report["findings"]:
+                        if finding.get("rule_id") == "go.lifecycle.file_handle":
+                            locations.append((finding["file"], finding["line"]))
+                else:
+                    for scan in report["runs"]:
+                        self.assertTrue(all(i.get("executionSuccessful", True)
+                                            for i in scan.get("invocations", [])))
+                        for finding in scan.get("results", []):
+                            if finding["ruleId"] == "go.lifecycle.file_handle":
+                                for location in finding["locations"]:
+                                    physical = location["physicalLocation"]
+                                    uri = urlsplit(physical["artifactLocation"]["uri"])
+                                    self.assertFalse(uri.query or uri.fragment)
+                                    locations.append((unquote(uri.path), physical["region"]["startLine"]))
+                self.assertCountEqual(locations, [(name, 6) for name in names])
+                self.assertEqual({p.name: p.read_bytes() for p in self.root.iterdir() if p.is_file()}, before)
+
     # A real, offline standard-library package guards the actual vet JSON/exit
     # contract; stub-only tests cannot prove we chose the right protocol.
     def test_real_vet_json_finding_and_gofmt_are_read_only(self) -> None:

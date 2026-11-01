@@ -379,6 +379,11 @@ if run_life:
     if rows:
         for parts in rows:
             location = parts[0]
+            try:
+                source_path, source_line = location.rsplit(":", 1)
+                source_line = int(source_line)
+            except ValueError:
+                source_path, source_line = location, 0
             kind = parts[1] if len(parts) > 1 else ""
             message = parts[2] if len(parts) > 2 else ""
             severity = LIFE_SEVERITY.get(kind, "warning")
@@ -388,8 +393,8 @@ if run_life:
             new_records.append({
                 "rule": f"go.lifecycle.{kind or 'imbalance'}",
                 "category_id": "golang.lifecycle-correlation",
-                "path": location,
-                "line": 0,
+                "path": source_path,
+                "line": source_line,
                 "col": 1,
                 "severity": severity,
                 "message": f"{summary} [{location}] — {desc}"[:300],
@@ -400,10 +405,9 @@ if run_life:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         records.extend(new_records)
         if as_text:
-            for rec in new_records:
+            for rec, parts in zip(new_records, rows):
                 emit(f"[{rec['severity']}] {LIFE_SUMMARY.get(rec['rule'].rsplit('.', 1)[-1], rec['message'])} (1 found) — {rec['rule']}")
-                location = rec["path"]
-                emit(f"    {location}  {rec['message'][:180]}")
+                emit(f"    {parts[0]}  {rec['message'][:180]}")
     elif life_status == 0:
         if as_text:
             emit("good: All tracked resource acquisitions have matching cleanups")
