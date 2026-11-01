@@ -372,7 +372,8 @@ class SQLValueCaptureTests(unittest.TestCase):
             prefix = 'enabled = True\n' if name == 'captured-global' else ''
             source = (prefix + 'class Engine:\n' + f'    def consume(self, values{signature}):\n' + body
                       + '    def run(self, cursor, user, target):\n'
-                      + f'        self.consume(({unsafe} for unused in [1]){actual})\n')
+                      + f'        self.consume(({unsafe} for unused in [1]){actual})\n'
+                      + '        cursor.execute("SELECT %s", (user,))\n')
             with self.subTest(case=name):
                 path = self.artifacts / f'consumer-refusal-{name}.py'
                 path.write_text(source, encoding='utf-8')
@@ -401,14 +402,17 @@ class SQLValueCaptureTests(unittest.TestCase):
         for name, source in (
                 ('decorated', 'def decorate(fn):\n    return fn\n@decorate\ndef collect(values):\n'
                  '    return [query for query in values]\n'
-                 + program(f'    collect({unsafe} for unused in [1])\n')),
+                 + program(f'    collect({unsafe} for unused in [1])\n'
+                           '    cursor.execute("SELECT %s", (user,))\n')),
                 ('escaped-method', 'class Engine:\n    def collect(self, values):\n'
                  '        return [query for query in values]\n'
                  '    def run(self, cursor, user):\n        held = self.collect\n'
-                 f'        self.collect({unsafe} for unused in [1])\n'),
+                 f'        self.collect({unsafe} for unused in [1])\n'
+                 '        cursor.execute("SELECT %s", (user,))\n'),
                 ('undefined-global', 'def collect(values):\n'
                  '    return [query for query in values if undefined_flag]\n'
-                 + program(f'    collect({unsafe} for unused in [1])\n'))):
+                 + program(f'    collect({unsafe} for unused in [1])\n'
+                           '    cursor.execute("SELECT %s", (user,))\n'))):
             with self.subTest(case=name):
                 path = self.artifacts / f'consumer-identity-{name}.py'
                 path.write_text(source, encoding='utf-8')
@@ -485,11 +489,11 @@ class SQLValueCaptureTests(unittest.TestCase):
 
     def test_generator_consumer_boundaries_are_explicit(self):
         bodies = (
-            '    pending = (f"SELECT {item}" for item in [user])\n    consume(pending)\n',
-            '    pending = ((query := f"SELECT {item}") for item in [user])\n    next(pending)\n',
-            '    pending = (f"SELECT {item}" for item in [user])\n    list = unknown\n    list(pending)\n',
-            '    pending = (f"SELECT {item}" for item in [user])\n    if rows:\n        pending = None\n    list(pending)\n',
-            '    pending = (f"SELECT {item}" for item in [user])\n    def nested():\n        list(pending)\n',
+            '    pending = (f"SELECT {item}" for item in [user])\n    consume(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = ((query := f"SELECT {item}") for item in [user])\n    next(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = (f"SELECT {item}" for item in [user])\n    list = unknown\n    list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = (f"SELECT {item}" for item in [user])\n    if rows:\n        pending = None\n    list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = (f"SELECT {item}" for item in [user])\n    def nested():\n        list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
         )
         for index, body in enumerate(bodies):
             with self.subTest(case=index):
@@ -497,6 +501,20 @@ class SQLValueCaptureTests(unittest.TestCase):
                 path.write_text(program(body), encoding='utf-8')
                 with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator.*incomplete'):
                     list(detector.find([path]))
+
+    def test_no_sink_refusal_shapes_need_no_sql_flow(self):
+        # Since 607712f9 a file with no modeled SQL sink call skips SQL flow. These are refusal shapes from this
+        # file with no sink: they are complete and clean. The refusal fixtures keep a trailing sink for that reason.
+        for name, body in (
+                ('generator-boundary', '    pending = (f"SELECT {item}" for item in [user])\n    consume(pending)\n'),
+                ('list-consumer', '    queries = []\n    alias = queries\n'
+                 '    queries.extend(f"SELECT {user}" for item in [1])\n'),
+                ('closure-predicate', '    queries = ["SELECT 1"]\n    def add(value):\n        queries.append(value)\n'
+                 '    any(hold(queries) for query in queries)\n    add(f"SELECT {user}")\n')):
+            with self.subTest(control=name):
+                path = self.artifacts / f'no-sink-control-{name}.py'
+                path.write_text(program(body), encoding='utf-8')
+                self.assertEqual(list(detector.find([path])), [])
 
     def test_next_projection_preserves_sql_risk(self):
         cases = (
@@ -523,12 +541,12 @@ class SQLValueCaptureTests(unittest.TestCase):
 
     def test_next_projection_refuses_unmodeled_effects(self):
         bodies = (
-            '    pending = ((query := f"SELECT {user}") for item in rows)\n    next(pending, None)\n',
+            '    pending = ((query := f"SELECT {user}") for item in rows)\n    next(pending, None)\n    cursor.execute(next(pending, "SELECT 1"))\n',
             '    pending = (cursor.execute(f"SELECT {user}") for item in rows)\n    next(pending, None)\n',
-            '    pending = (f"SELECT {user}" for item in rows)\n    next(pending)\n    list(pending)\n',
-            '    pending = (f"SELECT {user}" for item in rows)\n    next = unknown\n    next(pending)\n',
-            '    pending = (f"SELECT {user}" for item in rows)\n    alias = pending\n    next(pending)\n    tuple(alias)\n',
-            '    other = (f"SELECT {user}" for item in rows)\n    pending = (list(other) for item in [1])\n    next(pending)\n',
+            '    pending = (f"SELECT {user}" for item in rows)\n    next(pending)\n    list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = (f"SELECT {user}" for item in rows)\n    next = unknown\n    next(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = (f"SELECT {user}" for item in rows)\n    alias = pending\n    next(pending)\n    tuple(alias)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    other = (f"SELECT {user}" for item in rows)\n    pending = (list(other) for item in [1])\n    next(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
         )
         for index, body in enumerate(bodies):
             with self.subTest(case=index):
@@ -683,12 +701,12 @@ class SQLValueCaptureTests(unittest.TestCase):
                 self.inspect('opaque-' + name, program(body), expected)
 
         refusals = (
-            '    range = unknown\n    consume(index for index in range(f"SELECT {user}"))\n',
-            '    pending = (None for item in [user])\n    consume(pending)\n    list(pending)\n',
-            '    query = f"SELECT {user}"\n    consume((query := "SELECT 1") for item in [1])\n',
+            '    range = unknown\n    consume(index for index in range(f"SELECT {user}"))\n    cursor.execute("SELECT %s", (user,))\n',
+            '    pending = (None for item in [user])\n    consume(pending)\n    list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    query = f"SELECT {user}"\n    consume((query := "SELECT 1") for item in [1])\n    cursor.execute(query)\n',
             '    consume(cursor.execute(f"SELECT {user}") for item in [1])\n',
-            '    consume(f"name = {item}" for item in [user])\n',
-            '    query = "SELECT 1"\n    pending = (query for item in [1])\n    consume(pending)\n    query = f"SELECT {user}"\n    consume(pending)\n',
+            '    consume(f"name = {item}" for item in [user])\n    cursor.execute("SELECT %s", (user,))\n',
+            '    query = "SELECT 1"\n    pending = (query for item in [1])\n    consume(pending)\n    query = f"SELECT {user}"\n    consume(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
         )
         for index, body in enumerate(refusals):
             with self.subTest(refusal=index):
@@ -710,9 +728,9 @@ class SQLValueCaptureTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.inspect(name, program(body), expected)
         for index, body in enumerate((
-                '    left = []\n    if rows:\n        left = user\n    consume(item for item in left + [])\n',
-                '    left = [f"name = {user}"]\n    consume(item for item in left + [])\n',
-                '    left = [1]\n    left = user\n    consume(item for item in left + [])\n')):
+                '    left = []\n    if rows:\n        left = user\n    consume(item for item in left + [])\n    cursor.execute(left[0])\n',
+                '    left = [f"name = {user}"]\n    consume(item for item in left + [])\n    cursor.execute(left[0])\n',
+                '    left = [1]\n    left = user\n    consume(item for item in left + [])\n    cursor.execute(left[0])\n')):
             with self.subTest(refusal=index):
                 path = self.artifacts / f'collection-refusal-{index}.py'
                 path.write_text(program(body), encoding='utf-8')
@@ -745,9 +763,9 @@ class SQLValueCaptureTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.inspect(name, program(body), expected)
         refusals = (
-            '    query = "SELECT 1"\n    pending = ((query := f"SELECT {user}") for row in rows)\n    for item in pending:\n        pass\n',
-            '    pending = ((query := "SELECT 1") for row in rows)\n    for item in pending:\n        pass\n',
-            '    pending = (None for row in rows)\n    for item in pending:\n        break\n    list(pending)\n',
+            '    query = "SELECT 1"\n    pending = ((query := f"SELECT {user}") for row in rows)\n    for item in pending:\n        pass\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = ((query := "SELECT 1") for row in rows)\n    for item in pending:\n        pass\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = (None for row in rows)\n    for item in pending:\n        break\n    list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
             '    for item in (cursor.execute(f"SELECT {user}") for row in rows):\n        pass\n',
         )
         for index, body in enumerate(refusals):
@@ -777,13 +795,13 @@ class SQLValueCaptureTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.inspect(name, program(body), expected)
         refusals = (
-            '    query, = ((query := "SELECT 1") for item in [1, 2])\n',
+            '    query, = ((query := "SELECT 1") for item in [1, 2])\n    cursor.execute(query)\n',
             '    query, = (cursor.execute(f"SELECT {user}") for item in [1])\n',
-            '    next = consume\n    next(f"SELECT {user}" for item in [1])\n',
-            '    pending = (f"SELECT {user}" for item in [1, 2])\n    next(pending)\n    list(pending)\n',
-            '    pending = [f"SELECT {user}"] if rows else ("SELECT 1" for item in [1])\n    list(pending)\n',
-            '    pending = ((query := "SELECT 1") for item in [1])\n    min(pending, key=unknown_callback)\n',
-            '    pending = ((query := "SELECT 1") for item in [1])\n    min(pending, key=lambda item: callback(item))\n',
+            '    next = consume\n    next(f"SELECT {user}" for item in [1])\n    cursor.execute("SELECT %s", (user,))\n',
+            '    pending = (f"SELECT {user}" for item in [1, 2])\n    next(pending)\n    list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = [f"SELECT {user}"] if rows else ("SELECT 1" for item in [1])\n    list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = ((query := "SELECT 1") for item in [1])\n    min(pending, key=unknown_callback)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    pending = ((query := "SELECT 1") for item in [1])\n    min(pending, key=lambda item: callback(item))\n    cursor.execute(next(pending, "SELECT 1"))\n',
         )
         for index, body in enumerate(refusals):
             with self.subTest(refusal=index):
@@ -912,6 +930,18 @@ class SQLValueCaptureTests(unittest.TestCase):
                 self.inspect('fromkeys-' + name,
                              program(f'    mapping = {constructor}\n    qs.extra(select=mapping)\n'), expected)
 
+    def test_sql_keywords_in_identifiers_do_not_create_sql_templates(self):
+        for name in ('call', 'select', 'update', 'drop', 'token'):
+            for expression in (f'1 + {name}.end()', f'f"{{{name}}}"'):
+                source = (f'def run(cursor, {name}):\n    value = {expression}\n'
+                          '    cursor.execute(value)\n')
+                with self.subTest(identifier=name, expression=expression):
+                    self.inspect('identifier-' + name + '-' + str(expression.startswith('1')), source, ())
+            source = (f'def run(cursor, {name}):\n'
+                      f'    cursor.execute(f"SELECT {{{name}}}")\n')
+            with self.subTest(sql_template=name):
+                self.inspect('identifier-real-sql-' + name, source, ((CRITICAL, 2),))
+
     def test_fromkeys_consumes_once_after_eager_default(self):
         unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
         safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
@@ -997,33 +1027,33 @@ class SQLValueCaptureTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.inspect(name, program(body), expected)
         refusals = (
-            '    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    alias = queries\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    alias = queries if user else []\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    hold(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    wrapper = {"queries": queries}\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    def alias():\n        return queries\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    class Alias:\n        value = queries\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    def alias():\n        return queries\n    queries = []\n    held = alias()\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    alias = lambda: queries\n    queries = []\n    held = alias()\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    alias = (queries for item in [1])\n    queries = []\n    held = next(alias)\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    held = locals()\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    snapshot = locals\n    queries = []\n    held = snapshot()\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    qs.saved: object = queries\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    rows[0]: object = queries\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    match queries:\n        case alias:\n            pass\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    yield queries\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    queries += (f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    for alias in [queries]:\n        queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    queries.clear()\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    def examine(values):\n        return values\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    def examine(values):\n        return iter(values)\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    def examine(values):\n        def capture():\n            return values\n        hold(capture)\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    def examine(values):\n        return locals()\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    def examine(values):\n        return len(values)\n    held = examine\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    def examine(values):\n        return len(values)\n    examine.__code__ = other_code\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    def examine(values):\n        return len(values)\n    queries = []\n    try:\n        examine(queries)\n    except Exception:\n        pass\n    queries.extend(f"SELECT {user}" for item in [1])\n',
-            '    queries = []\n    pending = reversed(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n',
+            '    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    alias = queries\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    alias = queries if user else []\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    hold(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    wrapper = {"queries": queries}\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    def alias():\n        return queries\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    class Alias:\n        value = queries\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    def alias():\n        return queries\n    queries = []\n    held = alias()\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    alias = lambda: queries\n    queries = []\n    held = alias()\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    alias = (queries for item in [1])\n    queries = []\n    held = next(alias)\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    held = locals()\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    snapshot = locals\n    queries = []\n    held = snapshot()\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    qs.saved: object = queries\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    rows[0]: object = queries\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    match queries:\n        case alias:\n            pass\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    yield queries\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    queries += (f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    for alias in [queries]:\n        queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    queries.clear()\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    def examine(values):\n        return values\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    def examine(values):\n        return iter(values)\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    def examine(values):\n        def capture():\n            return values\n        hold(capture)\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    def examine(values):\n        return locals()\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    def examine(values):\n        return len(values)\n    held = examine\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    def examine(values):\n        return len(values)\n    examine.__code__ = other_code\n    queries = []\n    examine(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    def examine(values):\n        return len(values)\n    queries = []\n    try:\n        examine(queries)\n    except Exception:\n        pass\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
+            '    queries = []\n    pending = reversed(queries)\n    queries.extend(f"SELECT {user}" for item in [1])\n    cursor.execute(queries[-1])\n',
         )
         for index, body in enumerate(refusals):
             with self.subTest(refusal=index):
@@ -2406,7 +2436,7 @@ class SQLValueCaptureTests(unittest.TestCase):
                 ('predicate-exception-frame', '    try:\n        any(query == "SELECT 1" for query in queries)\n    except Exception:\n        pass\n')):
             source = program('    queries = ["SELECT 1"]\n'
                              '    def add(value):\n        queries.append(value)\n'
-                             + expression + f'    add({unsafe})\n')
+                             + expression + f'    add({unsafe})\n' + '    cursor.execute(queries[-1])\n')
             with self.subTest(boundary=name):
                 path = self.artifacts / f'closure-predicate-refusal-{name}.py'
                 path.write_text(source, encoding='utf-8')
@@ -2422,7 +2452,8 @@ class SQLValueCaptureTests(unittest.TestCase):
             list(detector.find([path]))
         source = program('    queries = ["SELECT count(*) FROM users WHERE name = \'alice\'"]\n'
                          '    def add():\n' + f'        queries.append({unsafe})\n'
-                         '    sum(add() or 0 for query in queries)\n')
+                         '    sum(add() or 0 for query in queries)\n'
+                         '    cursor.execute(queries[-1])\n')
         path = self.artifacts / 'closure-during-reducer.py'
         path.write_text(source, encoding='utf-8')
         with self.assertRaisesRegex(detector.SQLFlowLimit, 'closure mutation during list iteration.*incomplete'):
@@ -2483,11 +2514,13 @@ class SQLValueCaptureTests(unittest.TestCase):
                 f'    {consumer}(any(index == other for other in [1]) for index in [1])\n'), ())
         for consumer in ('any', 'all', 'next'):
             source = program('    pending = ("SELECT 1" for item in [1])\n'
-                             f'    {consumer}(list(pending) for item in [1])\n')
-            path = self.artifacts / f'{consumer}-captured-cursor-effect.py'
-            path.write_text(source, encoding='utf-8')
-            with self.assertRaisesRegex(detector.SQLFlowLimit, 'partial generator effects.*incomplete'):
-                list(detector.find([path]))
+                             f'    {consumer}(list(pending) for item in [1])\n'
+                             '    cursor.execute(next(pending, "SELECT 1"))\n')
+            with self.subTest(consumer=consumer):
+                path = self.artifacts / f'{consumer}-captured-cursor-effect.py'
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'partial generator effects.*incomplete'):
+                    list(detector.find([path]))
 
     def test_real_sqlite_list_iteration_mutations_are_not_clean(self):
         unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
@@ -2516,9 +2549,9 @@ class SQLValueCaptureTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.inspect(name, program(body), expected)
         refusals = (
-            '    for item in rows:\n        pending = (f"SELECT {user}" for unused in [1])\n        alias = pending\n        list(pending)\n',
-            '    for item in rows:\n        pending = (f"SELECT {user}" for unused in [1])\n        for query in pending:\n            break\n',
-            '    for item in rows:\n        pending = (f"SELECT {user}" for unused in [1])\n        wrapper = (query for query in pending)\n        list(pending)\n',
+            '    for item in rows:\n        pending = (f"SELECT {user}" for unused in [1])\n        alias = pending\n        list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    for item in rows:\n        pending = (f"SELECT {user}" for unused in [1])\n        for query in pending:\n            break\n    cursor.execute(next(pending, "SELECT 1"))\n',
+            '    for item in rows:\n        pending = (f"SELECT {user}" for unused in [1])\n        wrapper = (query for query in pending)\n        list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
         )
         for index, body in enumerate(refusals):
             with self.subTest(refusal=index):

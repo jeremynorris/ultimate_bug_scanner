@@ -124,7 +124,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 ## 🎯 **The Solution: Your 24/7 Bug Hunting Partner**
 
 ### 🧠 Language-Aware Meta-Runner
-- `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, Bash, and PHP** in the same repo and fans out to per-language scanners.
+- `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, Bash, PHP, and PostgreSQL SQL** in the same repo and fans out to per-language scanners.
 - Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif|toon` for consistent downstream tooling.
 - Modules download lazily (PATH → repo `modules/` → cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
 - Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
@@ -142,6 +142,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - `--comparison=<baseline.json>` diff the latest combined summary against a stored run. Deltas feed into console output, JSON, HTML, and SARIF automation metadata so CI can detect regressions.
 - `--report-json=<file>` writes an enriched summary (project, totals, git metadata, optional comparison block) that you can archive or share with teammates/CI.
 - `--python-pattern-counts=<file>` writes unthresholded per-file/per-rule Python pattern counts, with threshold, severity, context and completeness metadata. See the [count contract](#python-pattern-count-export); this is independent of capped finding samples.
+- `--all-occurrences` opts JSONL into individual source occurrences with code, stable identities and explicit completeness. `--max-occurrences=N` bounds the export without changing scan counts. See [complete occurrence export](#complete-occurrence-export).
 - `--html-report=<file>` emits a standalone HTML preview showing totals, trends vs. baseline, and per-language breakdowns—ideal for attaching to PRs or chat updates.
 - `--also=FORMAT:FILE` writes another rendering of the same scan, including the full findings ledger. Repeat it for JSON, JSONL, SARIF, or TOON; each selected module runs once. The primary `--format` still controls stdout. Relative destinations use the invocation directory, and two reports cannot target the same file. TOON requires the same verified encoder as `--format=toon`.
 - All shareable outputs inject GitHub permalinks when UBS is run inside a git repo with a GitHub remote. Text output annotates `path:line` references, stdout JSON gains `git.*` metadata plus a `permalink` on every finding sample, and merged SARIF runs carry `properties.permalink` on each result location together with `versionControlProvenance` and `automationDetails` keyed by the comparison id. Permalinks are relative to the repository root even when you scan a subdirectory.
@@ -244,6 +245,50 @@ configurable through `UBS_PHP_MAX_TOKENS`, `UBS_PHP_MAX_NESTING` and
 `UBS_PHP_MAX_STEPS`. PHP confidence remains `unknown` pending independent corpus
 calibration; fixture coverage is not a calibrated confidence score.
 
+#### PostgreSQL migration and function privileges
+
+`.sql`, `.psql`, and `.pgsql` files use a bounded PostgreSQL DDL analyzer without
+requiring a database, PostgreSQL executable, or ast-grep:
+
+```bash
+ubs --only=sql --fail-on-warning --format=json migrations/
+ubs --staged --format=sarif --fail-on-warning
+ubs explain sql.security.definer-public-execute
+```
+
+Two warning rules check `SECURITY DEFINER` functions: function-local search paths
+that permit object shadowing, and `PUBLIC EXECUTE` exposure. The analyzer tracks
+literal input signatures, PostgreSQL type aliases, overloads, named/default/OUT
+parameters, selected `ALTER FUNCTION` changes, grants/revokes, default execution
+privileges, transactions and savepoints. Creating and restricting a function in
+one transaction stays clean; revoking access after a commit retains the earlier
+exposure finding. Revoking a grant option does not revoke execution.
+
+Comments, quoted identifiers, strings and dollar-quoted bodies are separated
+lexically. A body containing fake DDL or suppression text cannot alter the outer
+migration. Actual SQL comments support `ubs:ignore[rule-id]`. SQL categories are
+`sql.search-path` (1) and `sql.privileges` (2); `--skip-sql=1` and persistent
+`.ubs.json` policy use the same selection. JSON, JSONL, SARIF, text, staged scans,
+baseline filtering and the normal incremental cache use the shared runner.
+
+The analysis covers each selected file in its own statement order. It does not
+infer migration order across files, execute function bodies, inspect a deployed
+catalog, or certify all database access controls. Fresh function defaults follow
+PostgreSQL's standard PUBLIC execution grant unless the selected migration changes
+it. Existing `CREATE OR REPLACE` ACLs, unproved schema CREATE privileges, role
+changes, dynamic SQL, psql includes, unsupported procedural DDL and malformed or
+budget-exhausted input produce explicit incomplete reports (exit 2). An empty
+search path is accepted only for the bounded SQL-body proof; unqualified relations
+still expose implicit temporary-schema lookup. Custom `--rules` for SQL are
+explicitly unsupported. No warning is emitted merely for ordinary `DELETE` or
+`UPDATE` statements. Limits are 4 MiB, 200,000 tokens, 10,000 statements and 2,000
+function identities and 64 retained savepoints per source. Confidence remains uncalibrated.
+
+The underlying privilege and search-path semantics follow PostgreSQL's
+[CREATE FUNCTION security guidance](https://www.postgresql.org/docs/current/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY),
+[search_path documentation](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-SEARCH-PATH),
+and [REVOKE semantics](https://www.postgresql.org/docs/current/sql-revoke.html).
+
 #### Shareable output quickstart
 ```bash
 # 1) Capture a baseline JSON (checked into CI artifacts or local history)
@@ -283,7 +328,9 @@ sample limits, rule thresholds and exit policy stay unchanged; JSONL export
 does not imply complete occurrence coverage for every analyzer or additivity
 for analyses that depend on cross-file context. The separate
 [Python pattern-count export](#python-pattern-count-export) defines its own
-distinct-line count and completeness contract.
+distinct-line count and completeness contract. Request
+[`--all-occurrences`](#complete-occurrence-export) when a consumer needs every
+available source occurrence and an explicit check that none are missing.
 
 ---
 
@@ -1134,6 +1181,8 @@ Git Integration:
 Output Control:
   --format=FMT             Output format: text|json|jsonl|sarif|toon (default: text)
   --beads-jsonl=FILE      Write JSONL summary alongside normal output for Beads/"strung"
+  --all-occurrences      JSONL source occurrences, code, stable IDs and completeness
+  --max-occurrences=N    Scan-wide occurrence export limit (default 100000; max 1000000)
   --python-pattern-counts=FILE  Write unthresholded Python pattern counts as JSON
   --no-color               Force disable ANSI colors
   OUTPUT_FILE              Save report to file (auto-tees to stdout)
@@ -1328,6 +1377,138 @@ ubs -v --fail-on-warning --exclude=legacy --include-ext=js,ts,tsx . report.txt
 {"type":"scanner","project":"/path/to/project","language":"python","files":42,"critical":1,"warning":3,"info":12,"timestamp":"2025-11-22T09:04:20Z"}
 {"type":"totals","project":"/path/to/project","files":99,"critical":1,"warning":3,"info":27,"timestamp":"2025-11-22T09:04:22Z"}
 ```
+
+### Complete occurrence export
+
+For editor diagnostics and other machine consumers, request the opt-in JSONL
+occurrence interface:
+
+```bash
+ubs src --ci --format=jsonl --all-occurrences > occurrences.jsonl
+ubs src --ci --format=jsonl --all-occurrences --max-occurrences=10000
+ubs src --ci --format=json --all-occurrences --also=jsonl:occurrences.jsonl
+ubs --schema=jsonl
+```
+
+The flag requires a JSONL destination: `--format=jsonl`, `--also=jsonl:FILE`,
+or `--beads-jsonl=FILE`. It cannot be combined with `--jsonl-summary-only`.
+All requested renderings still come from one scan. The efficient sampled
+summaries remain the default, and the option does not change selected rules,
+severities, suppression, thresholds, or analyzer work limits. Python's separate
+`--python-pattern-counts=FILE` export remains unthresholded and independent.
+
+**Read the final totals record before accepting a complete diagnostic set.**
+Every scanner record and the final totals record contain an
+`occurrence_export` object with `schema: "ubs.occurrence-export/1"`.
+Only its `complete: true` promises that the selected analysis finished, counts
+reconcile exactly, and all counted occurrences were delivered with source
+locations and full available code. A missing final totals record, an error
+envelope, or absent completeness metadata never proves completeness.
+
+Empty staged/diff selections retain exit 0 but now deliver a final totals
+record to every requested JSONL destination, with `complete: false`,
+`analysis_complete: false`, and reason `no_files_scanned`. A selection with no
+supported language retains the existing exit 3 policy and the same explicit
+no-coverage metadata. Neither case is presented as a completed clean analysis.
+
+The stream contains these records in order:
+
+| Record | Contract |
+|--------|----------|
+| `type: "finding"`, `schema: "ubs.occurrence/1"` | One active source occurrence, always `count: 1`. Includes `occurrence_id`, `rule_id`, `language`, `severity`, `file`, `line`, `col`, `code`, `code_available`, and `code_truncated`, plus the canonical message, fingerprint and analyzer evidence. |
+| `type: "rule_summary"` | One language/rule/severity group with `reported`, `emitted`, `omitted`, and `unlocated`. Here `reported` is the active weighted canonical ledger count for this rule; missing ledger records cannot be attributed to a rule from samples. |
+| `type: "scanner"` | Existing per-language counts and execution status, failure details when present, and occurrence coverage for that language. |
+| `type: "totals"` | Last record: existing combined counts, status and failed modules, with scan-wide occurrence coverage. |
+
+Locations are one-based and use the original source paths. `code` is the physical
+source line without its CR/LF terminator; indentation is preserved. Python code
+decoding honors its encoding cookie. A staged scan reads code from the analyzed
+index snapshot, even when the working file has different contents. An unavailable
+line is `code: ""`, `code_available: false`; it is never replaced with a diagnostic
+message and presented as source text.
+
+`occurrence_id` has the form `sha256:<64 lowercase hexadecimal digits>`. Version 1
+hashes the language, rule, project-relative source path, line, column and canonical
+fingerprint. It is independent of timestamps, output limits and temporary scan
+directories, and is stable for repeated scans of the same unchanged input and
+options. Distinct counted occurrences remain distinct, including repeated text.
+IDs can change after source edits, line movement or changes to the selected
+analysis; they are not a cross-version semantic identity guarantee. The existing
+`fingerprint` retains its baseline semantics. Baseline filtering happens before
+export limits, and changing the export limit does not alter baseline contents.
+
+Coverage fields distinguish the execution result from the delivered locations:
+
+| Field | Meaning |
+|-------|---------|
+| `analysis_complete` | All selected analysis completed according to the scanner/run status. A partial analyzer can retain useful findings while this is false. |
+| `locations_complete` | Reported counts and ledger counts reconcile, and every counted source occurrence was emitted with a usable location. |
+| `complete` | Both dimensions above are complete and every emitted code line is available and untruncated. |
+| `reported` | Existing summary counts, summed across critical, warning and info. |
+| `accounted` | Active canonical ledger occurrences, including weighted aggregates. |
+| `emitted` | Number of concrete occurrence records actually emitted. |
+| `omitted` | Undelivered count, computed per severity as `max(reported, accounted) - emitted`. |
+| `unlocated` | Accounted occurrences for which a producer has no concrete source site. |
+| `code_unavailable`, `code_truncated` | Emitted source occurrences whose code could not be read or exceeded the text limit. |
+| `truncated` | The record limit or code text limit omitted requested output. |
+| `reasons` | Explicit reasons for incomplete coverage, including analysis failures, count mismatches, missing locations, output limits or code extraction limits. |
+| `counts` | The same `reported`, `accounted`, `emitted`, `omitted` accounting separately for `critical`, `warning`, and `info`. |
+
+For example, a complete 50-warning ledger exported with a limit of 10 has
+`reported: 50`, `accounted: 50`, `emitted: 10`, `omitted: 40`,
+`truncated: true`, and `complete: false`. Its scanner still reports 50 warnings.
+A completed analyzer can instead have `analysis_complete: true` with
+`locations_complete: false` when a rule reports an aggregate without identifying
+each source site. UBS does not fabricate locations to make these counts match.
+Zero-count project notes and suppressed records do not become occurrences;
+report-only AST evidence does not inflate the counted ledger.
+
+The exporter reuses the full finding sinks already produced by all shipped
+language modules. Summary previews stay capped. In occurrence mode, Rust's
+tech-debt/test-marker checks and Swift's package checks preserve their counted
+source sites before rendering. Rust's arithmetic spawn/handle and lifecycle
+heuristics, and Elixir's arithmetic net-count rules, remain explicitly unlocated
+aggregates. An enabled Rust type-narrowing analyzer failure marks occurrence-mode
+analysis partial and prevents reuse of that incomplete result from cache.
+Legacy or third-party
+producers with only sampled findings are reported incomplete when their counts
+cannot be accounted for; the exporter never falls back to summary samples and
+calls them complete.
+
+#### Bounds and consumer checks
+
+`--max-occurrences` accepts an integer from 1 through 1,000,000 and defaults to
+100,000 across the entire scan, rather than per file or language. It limits
+exported source records after analysis and baseline filtering. The exporter still
+reads the ledger to report exact omitted counts. It streams the ledger rather
+than materializing all occurrences in memory. Per-rule and scanner summaries
+remain available after the source-record cap is reached.
+At most 10,000 distinct language/rule/severity groups are accepted; exceeding
+that metadata bound fails the export explicitly and preserves its previous file.
+
+Each code field is limited to 4,096 decoded characters. A longer line sets
+`code_truncated: true` and makes the export incomplete. Code extraction keeps
+eight source readers, caches at most 1,024 requested lines, and has a separate
+256 Mi-character read-work budget. Python encoding detection reads at most
+64 KiB from each of the first two header lines. A read/decode failure or code
+work limit sets `code_available: false` and an explicit reason. These bounds
+do not change analyzer counts or relax any existing analysis budget.
+
+Finding-based exit codes remain unchanged by output caps. Analyzer failures still
+retain the existing partial-run exit policy; report delivery failures exit 2 and
+preserve a previous destination file. Consumers requiring a complete diagnostic
+set must also check the last record, for example:
+
+```bash
+jq -e -s '.[-1] | .type == "totals" and .occurrence_export.complete == true' occurrences.jsonl
+jq -c 'select(.type == "finding" and .schema == "ubs.occurrence/1") |
+       {occurrence_id, rule_id, severity, file, line, col, code}' occurrences.jsonl
+```
+
+Completeness is scoped to the selected inputs, rules and enabled analyses; it
+does not claim coverage of excluded files, skipped categories or all possible
+bugs. Cross-file thresholds remain selection-dependent, so combining separately
+scanned subsets is not generally equivalent to scanning their union.
 
 ### Python pattern count export
 
@@ -1822,7 +2003,7 @@ If a helper is modified or corrupted, the scanner fails safely with remediation 
 
 ### **Unified Severity Normalization**
 
-All 13 language modules normalize their findings to a consistent severity scale, ensuring predictable output regardless of source language:
+All 14 language modules normalize their findings to a consistent severity scale, ensuring predictable output regardless of source language:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -2067,7 +2248,7 @@ Traditional linters were designed for **human developers** in **single-language 
 
 | Traditional Linting (Human-First) | UBS Approach (LLM-First) |
 |---|---|
-| **Goal:** Comprehensive coverage + auto-fix<br>**Speed:** 15-60 seconds acceptable<br>**Setup:** 30 min config per language<br>**Languages:** One tool per language<br>**False positives:** Must be <1% (frustrates humans)<br>**Output:** Human-readable prose | **Goal:** Critical bug detection + fast feedback<br>**Speed:** <5 seconds required<br>**Setup:** Zero config (instant start)<br>**Languages:** One scan for all 13 languages<br>**False positives:** 10-20% OK (LLMs filter instantly)<br>**Output:** Structured file:line for LLM parsing |
+| **Goal:** Comprehensive coverage + auto-fix<br>**Speed:** 15-60 seconds acceptable<br>**Setup:** 30 min config per language<br>**Languages:** One tool per language<br>**False positives:** Must be <1% (frustrates humans)<br>**Output:** Human-readable prose | **Goal:** Critical bug detection + fast feedback<br>**Speed:** <5 seconds required<br>**Setup:** Zero config (instant start)<br>**Languages:** One scan for all 14 languages<br>**False positives:** 10-20% OK (LLMs filter instantly)<br>**Output:** Structured file:line for LLM parsing |
 
 ### **2. LLMs Don't Need Auto-Fix—They ARE the Auto-Fix Engine**
 
@@ -2354,7 +2535,7 @@ Layer 4: Metrics collection  → Time-series quality tracking
 **This combination of speed + semantic understanding + correlation is unique.**
 
 **Unified multi-language runner:**
-- Auto-detects 13 languages in one scan
+- Auto-detects 14 languages in one scan
 - Parallel execution (Go + Python + Rust simultaneously)
 - Unified JSON/SARIF output for tooling
 - Module system with lazy download/caching
@@ -2485,7 +2666,7 @@ You wouldn't use a truck for a Formula 1 race. You wouldn't use a sports car to 
 These are fundamentally incompatible goals. ESLint would never accept "10-20% false positives are fine" or "skip auto-fix entirely."
 
 **2. Multi-language meta-runner**
-- The unified runner that auto-detects 13 languages is the core innovation
+- The unified runner that auto-detects 14 languages is the core innovation
 - This doesn't fit into any single linter's architecture
 - Each linter project has different maintainers, philosophies, release cycles
 
@@ -2648,7 +2829,7 @@ Use both.
 
 **A:** Probably! The module system makes it easy to add languages.
 
-**Current:** JavaScript/TypeScript, Python, Go, Rust, Java, Kotlin, C++, Ruby, Swift, C#, Elixir, Bash, PHP (13 languages)
+**Current:** JavaScript/TypeScript, Python, Go, Rust, Java, Kotlin, C++, Ruby, Swift, C#, Elixir, Bash, PHP, PostgreSQL SQL (14 languages)
 
 **Roadmap considerations:**
 - **Scala** - JVM ecosystem
@@ -2687,7 +2868,7 @@ But the core tool will always be free and open source.
 
 **This isn't trying to replace ESLint.** It's solving a different problem:
 
-> **"How do I give LLM coding agents the ability to self-audit across 13 languages with zero configuration overhead and sub-5-second feedback?"**
+> **"How do I give LLM coding agents the ability to self-audit across 14 languages with zero configuration overhead and sub-5-second feedback?"**
 
 No existing tool does this because:
 - Traditional linters are human-first (need auto-fix, low FP tolerance)
@@ -2797,28 +2978,29 @@ coverage/
 
 <!-- coverage:matrix -->
 
-| Detector Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
-| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ |
-| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ |
-| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ |
-| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ |
-| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
-| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ |
-| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ |
-| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ |
-| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
-| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ |
-| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ |
-| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ |
-| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ |
-| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ |
-| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ |
-| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ |
-| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ |
-| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ |
+| Detector Family | JS / TS | Python | Go | Rust | Java | Kotlin | C / C++ | Ruby | Swift | C# | Elixir | Bash | PHP | sql |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
+| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ |
+| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ✓ | ✓ | ✓ | ○ |
+| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ |
+| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ |
+| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | ○ | — | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
+| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | — | ○ | ○ |
+| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ○ | ○ |
+| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
+| PostgreSQL Function Privileges | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ✓ |
+| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ |
+| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ✓ | — | ✓ | ○ |
+| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ |
+| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
+| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ | — | ○ | ○ |
+| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ | — | ✓ | ○ |
 
 *(Legend: **✓** Implemented with dual-sided regression test pairs; **○** Planned; **—** N/A. Full details in [`docs/coverage-matrix.md`](docs/coverage-matrix.md).)*
 

@@ -556,11 +556,11 @@ class NullFlow:
                 if state.exit:
                     output.append(state)
                 else:
-                    output.extend(self.execute(statement, state))
+                    output.extend(self.run_statement(statement, state))
             states = self.unique(output)
         return states
 
-    def execute(self, statement: Statement, state: State) -> list[State]:
+    def run_statement(self, statement: Statement, state: State) -> list[State]:
         kind = statement.kind
         if kind == "definition":
             return [state]

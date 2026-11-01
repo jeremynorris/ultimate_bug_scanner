@@ -1015,6 +1015,7 @@ def _function_scopes(text, code):
                 type_ranges.append((closing + 1, arrow))
                 arrow_parameters[arrow] = (opening, closing)
 
+    # a nested helper recording one function's start, parameter span and body with four syntax flags; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def add(start, parameter_span, body, name='', declaration=False, concise=False, method=False):
         params_start, params_end = parameter_span
         if body in body_starts:
@@ -1631,6 +1632,7 @@ class _Flow:
             self.throws.append((frozenset(), state.copy()))
         return unusable
 
+    # binds one destructuring pattern over a span with its fact, state and position; the keywords carry nested-pattern context; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def bind_pattern(self, start, end, fact, state, position, missing=False, binding=None,
                      reference=None, input_kind=None, entry_checked=False):
         """Bind a pattern, preserving field identity and initializer order.
@@ -3579,6 +3581,7 @@ class _Engine:
         return (_step(result, label), {key: _step(fact, label) for key, fact in effects.items()},
                 output is not None, _step(thrown_value, label), thrown_state)
 
+    # one interprocedural call: callee, rule, root, location, bound arguments, incoming facts and the ancestor chain; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def widened_call(self, callee, rule, root, location, bound, incoming, ancestors, *, caller=None):
         """Join backedges into an ancestor; keep acyclic helper contexts separate.
 
@@ -3619,6 +3622,7 @@ class _Engine:
             self.enqueue(context)
         return context
 
+    # applies one callee's heap summary: incoming facts, state, output, writes, returned value and location, plus two keywords; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def apply_heap_output(self, incoming, state, output, writes, returned, location, *, widened=None, bound=None):
         self.budget.spend(1 + _heap_work(output.heap))
 

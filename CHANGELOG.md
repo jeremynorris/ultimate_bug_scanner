@@ -25,7 +25,46 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   critical metadata/equality diagnostics. These are precision corrections,
   not a calibrated security-coverage score.
 
+### Fixed
+
+- Python's SQL detector takes syntax evidence from literal strings and tracked
+  values. Identifiers such as `call`, `select` and `update` no longer create
+  SQL templates; interpolated SQL still produces the existing findings.
+
+- Python's I/O-in-loop rule checks that a candidate call actually repeats.
+  Comments, loop-like identifier text, one write around a generator argument,
+  and proven buffered EOF drains no longer produce performance warnings.
+  Repeated I/O, uncertain stream ownership and cursor resets remain candidates;
+  the existing project-wide threshold and suppression rules are unchanged.
+- Python's constant-time comparison analyzer resolves supported local
+  structural fingerprints from their receiver and method body. The C# flow
+  analyzer no longer needs a secret-comparison suppression for its state
+  signature. Unknown signatures, secret-bearing records, mutable aliases
+  and escaped receivers remain security findings.
+
+---
+
+## [v5.5.26] - 2026-11-01 [Release]
+
+### Known issues
+
+The first five are in v5.5.3 as well.
+
+- **Elixir scans can end partial (exit 2)** (#168). A public function that calls `apply/2,3`, or a file that runs SQL and passes a callback to a function the engine doesn't model, such as `spawn`, stops the SQL analysis. The report says `error: environment`, `reason: module-failed`, but there is nothing to fix in the environment. Findings are still reported, and `UBS_ALLOW_PARTIAL=1` returns the findings exit code.
+- **C# scans can end partial (exit 2) on a `ref`/`out` call the engine can't resolve** (#171), in a file with a SQL sink: `Dictionary.TryGetValue`, the `TryParse` overloads that take number styles or format providers, and cross-file helpers. The report now says `error: analysis`, `reason: analysis-incomplete`, with the file and line. `MailAddress.TryCreate` and the two-argument `TryParse` family no longer end partial.
+- **JavaScript and TypeScript taint analysis can stop at its work limit (exit 2)** (#177). The shape is many helpers called in sequence on one growing array. With no request source in that component, it now finishes, at 160 helpers in our rerun. With a request source in the component, 15 helpers finished and 40 stopped at `js.taint.command`. The report says `error: environment`, `reason: module-failed`, though the cause is the limit. Treat those results as partial, not clean.
+- **A Kotlin `lazy { … }` or `= { … }` property that builds an outbound request from a class field scans as an ordinary initializer.** If a request handler later puts request data in that field, the SSRF is not reported and the scan says ok, as in v5.5.13 and v5.5.3. Java lambdas, anonymous classes and Kotlin `object :` expressions in field initializers report incomplete analysis (exit 2) instead. A narrower check is tracked in bead `ultimate_bug_scanner-tz17`.
+- **`scripts/verify.sh` with no key fails on this release.** It defaults to keyless cosign, and this release has no keyless signatures, SLSA attestation or image signatures, because those need a GitHub Actions run and it was built and signed by hand. `SHA256SUMS` is signed with the project's minisign key, so set `UBS_MINISIGN_PUBKEY` first, as the README's integrity-first install shows.
+- **Python scans can end partial (exit 2) on `dict.fromkeys` over a generator** (#195), in a file the SQL detector reads, when the keys aren't proven to be strings, numbers or `None`. A dict comprehension builds the same dict and scans clean. ubs's own self-scan, which `scripts/cut-release.sh` requires, hit this and a second detector limit in two of its analyzer files, which were rewritten without behaviour change. The self-scan also carries 24 rule-scoped suppressions, with a reason at each site: 15 `py.functions.high-param-count` (bead `ultimate_bug_scanner-8tqg`), 6 `py.perf.io-in-loop`, two of them matches on comment text, and one each of `python.ctcompare.secret_eq`, `py.io.open-missing-with` and `py.parsing.json-loads-no-try`.
+
 ### Added
+
+- PostgreSQL SQL migrations now have a native bounded scanner for SECURITY
+  DEFINER search-path hazards and PUBLIC execution privileges. It models
+  overload signatures, grants/revokes, transaction publication and savepoints,
+  preserves explicit incomplete states, and participates in ordinary selection,
+  policy, incremental caching and machine reports. Independent semantic cases
+  and native JSON/SARIF fixtures cover unsafe migrations and hardened controls.
 
 - Elixir error handling now follows non-bang File results through local helpers,
   bindings, branches, matches and synchronous callbacks. Discarded or overwritten
@@ -42,6 +81,19 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 - Kotlin category 13 now follows request data into JDBC SQL execution, including Java synthetic properties, source-local helper summaries, SQL captured by prepared statements and statement-owned batch queues. Static SQL with actual value binding stays clean. Named arguments, literal defaults and multiline expression bodies retain helper flow; unsupported receiver and default semantics report incomplete analysis. JSON and SARIF retain source-to-sink evidence, and the SQL work limit participates in cache invalidation.
 
 ### Fixed
+
+- The CLI contract check for `--rules` now takes the modules that honour the flag from the `--rules` entry in `modules/contract.json`. Every other module must refuse the flag as documented (exit 2, `--rules is unsupported for <module>`), so PostgreSQL SQL is checked against its refusal instead of showing as uncovered. The contract's `--rules` list now names Elixir, which already honoured the flag.
+
+- File watching now observes active custom rules from project/environment policy
+  and sgconfig rule directories, including internal aliases, so rule-only edits
+  replace stale reports without expanding source selection. Cyclic source links
+  report invalid input and resume after repair instead of stopping the watcher.
+
+- Ruby path traversal analysis now follows proven `Pathname` receivers through
+  filesystem reads, writes, directory operations and selected helpers. It checks
+  both paths for rename/link operations, invalidates guards after path changes,
+  and keeps non-path arguments and unrelated receivers clean. Independent unsafe
+  and safe controls cover standalone and runner JSON/SARIF output.
 
 - Java/Kotlin SQL analysis recognizes selected Spring JdbcTemplate/JdbcOperations
   and NamedParameterJdbcTemplate/NamedParameterJdbcOperations execution APIs.

@@ -1236,6 +1236,7 @@ class SwiftEngine:
             # Testing assertions catch that error into their own result.
             self.thrown = thrown if catches_errors else join(thrown, raised)
 
+    # one Swift closure argument: name, receiver, token slice, state, bindings and depth, plus member_call; a parameter record is bead ultimate_bug_scanner-8tqg — ubs:ignore[py.functions.high-param-count]
     def callback(self, name, receiver, tokens, state, bindings, depth, member_call=False):
         if not self.callback_seen:
             self.callback_seen = True

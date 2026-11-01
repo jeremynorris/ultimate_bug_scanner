@@ -118,7 +118,7 @@ def joined(*values: Value) -> Value:
         literal = UNKNOWN
     refs = frozenset(ref for value in values for ref in value.refs)
     if all(value.array for value in values):
-        keys = dict.fromkeys(key for value in values for key, _ in value.items)
+        keys = {key: None for value in values for key, _ in value.items}
         items = {key: joined(*(dict(value.items).get(key, value.fallback or EMPTY) for value in values)) for key in keys}
         fallback = joined(*(value.fallback or EMPTY for value in values))
         return array_value(items, fallback)
@@ -546,14 +546,14 @@ class Engine:
 
     def merge(self, branches: tuple[tuple[dict[str, Value], dict[int, Object], str, Value], ...]) -> None:
         active = tuple(branch for branch in branches if branch[2] == "normal") or branches
-        keys = dict.fromkeys(key for env, _heap, _flow, _value in active for key in env)
+        keys = {key: None for env, _heap, _flow, _value in active for key in env}
         self.env = {key: joined(*(env.get(key, EMPTY) for env, _heap, _flow, _value in active)) for key in keys}
-        refs = dict.fromkeys(ref for _env, heap, _flow, _value in active for ref in heap)
+        refs = {ref: None for _env, heap, _flow, _value in active for ref in heap}
         heap = {}
         for ref in refs:
             objects = [branch_heap[ref] for _env, branch_heap, _flow, _value in active if ref in branch_heap]
             first = objects[0]
-            fields = dict.fromkeys(key for obj in objects for key, _value in obj.fields)
+            fields = {key: None for obj in objects for key, _value in obj.fields}
             heap[ref] = replace(first, query=joined(*(obj.query for obj in objects)),
                                 fields=tuple((key, joined(*(dict(obj.fields).get(key, EMPTY) for obj in objects))) for key in fields))
         self.heap = heap

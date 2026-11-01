@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1212,14 +1213,63 @@ _EVERY_MODULE_RULES = {
 }
 
 
+# Modules outside the contract's --rules list: one file each, in a language the module scans.
+_RULES_REFUSAL_PROJECTS = {
+    "sql": ("a.sql", "SELECT 1;\n"),
+}
+
+
+def _check_rules_refused(lang: str, display: str) -> None:
+    # A module outside the --rules list must refuse the flag, not ignore it.
+    if lang in _RULES_REFUSAL_PROJECTS:
+        grammar, pattern = "python", "print($$$A)"
+        name, source = _RULES_REFUSAL_PROJECTS[lang]
+    elif lang in _EVERY_MODULE_RULES:
+        grammar, pattern, name, source = _EVERY_MODULE_RULES[lang]
+    else:
+        return  # reported by rules_every_module_covered
+    with tempfile.TemporaryDirectory(prefix=f"ubs-rules-{lang}-") as tmp:
+        root = Path(tmp)
+        rules, project = root / "rules", root / "proj"
+        rules.mkdir()
+        project.mkdir()
+        (rules / "top.yml").write_text(f"id: custom.top-{lang}\nlanguage: {grammar}\nseverity: error\nmessage: m\n"
+                                       f"rule:\n  pattern: {pattern}\n", encoding="utf-8")
+        (project / name).write_text(source, encoding="utf-8")
+        proc = run(["--ci", "--no-cache", f"--only={lang}", "--format=json", f"--rules={rules}", str(project)],
+                   cwd=root, env={"UBS_NO_CACHE": "1"})
+        try:
+            doc = json.loads(proc.stdout)
+            status = doc.get("status")
+            messages = [m.get("message", "") for m in doc.get("failed_modules", []) if m.get("language") == lang]
+        except json.JSONDecodeError:
+            status, messages = None, []
+        wanted = f"--rules is unsupported for {display}"
+        report(f"rules_module_{lang}_refuses_custom_rules",
+               proc.returncode == 2 and status == "error" and any(m.startswith(wanted) for m in messages),
+               f"exit={proc.returncode} status={status} messages={messages}", proc)
+
+
 def check_rules_every_module_reports_custom_rules() -> None:
     # A10: java, rust, ruby, kotlin, cpp and go used to drop --rules entirely
-    # while reporting status ok. Every module must report a matching project
-    # rule, top-level or nested, with its authored severity.
+    # while reporting status ok. The contract's --rules entry lists the modules
+    # that honour the flag: each must report a matching project rule, top-level
+    # or nested, with its authored severity. Every other module must refuse the
+    # flag as documented (exit 2, status error, "--rules is unsupported for
+    # <display>") instead of ignoring it, so every module is still checked.
     contract = parse_json_document((REPO_ROOT / "modules" / "contract.json").read_text(encoding="utf-8"))
-    missing = set(contract["modules"]) - set(_EVERY_MODULE_RULES)
-    report("rules_every_module_covered", not missing, f"uncovered={sorted(missing)}")
+    honouring = set(next(e for e in contract["flags"] if e["flag"] == "--rules")["modules"])
+    refusing = set(contract["modules"]) - honouring
+    missing = ((honouring - set(_EVERY_MODULE_RULES))
+               | (refusing - set(_RULES_REFUSAL_PROJECTS) - set(_EVERY_MODULE_RULES)))
+    unknown = honouring - set(contract["modules"])
+    report("rules_every_module_covered", not missing and not unknown,
+           f"uncovered={sorted(missing)} unknown={sorted(unknown)}")
+    for lang in sorted(refusing):
+        _check_rules_refused(lang, contract["modules"][lang]["display"])
     for lang, (grammar, pattern, name, source) in _EVERY_MODULE_RULES.items():
+        if lang not in honouring:
+            continue
         with tempfile.TemporaryDirectory(prefix=f"ubs-rules-{lang}-") as tmp:
             root = Path(tmp)
             rules, project = root / "rules", root / "proj"
@@ -2087,7 +2137,9 @@ def check_robot_docs_flags_parse() -> None:
             # modules over the checkout's own modules/ directory (it reverted the
             # Python module once). Acceptance of both is covered elsewhere.
             continue
-        args = [example, "--only=python", "--ci", str(PY_CLEAN)]
+        # A documented example may include required companion flags, such as
+        # --format=jsonl --all-occurrences. Preserve its shell argument boundaries.
+        args = [*shlex.split(example), "--only=python", "--ci", str(PY_CLEAN)]
         if flag["name"] in ("--staged", "--diff"):
             args = [example, "--only=python", "--ci"]
         if flag["name"] == "--files":
